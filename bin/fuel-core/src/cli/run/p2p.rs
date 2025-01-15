@@ -12,7 +12,7 @@ use fuel_core::{
             MAX_RESPONSE_SIZE,
         },
         gossipsub_config::default_gossipsub_builder,
-        HeartbeatConfig,
+        heartbeat,
         Multiaddr,
     },
     types::{
@@ -46,12 +46,6 @@ pub struct P2PArgs {
     #[arg(requires_if(IsPresent, "enable_p2p"))]
     pub keypair: Option<KeypairArg>,
 
-    /// The name of the p2p Network
-    #[clap(long = "network", env)]
-    #[arg(required_if_eq("enable_p2p", "true"))]
-    #[arg(requires_if(IsPresent, "enable_p2p"))]
-    pub network: Option<String>,
-
     /// p2p network's IP Address
     #[clap(long = "address", env)]
     pub address: Option<IpAddr>,
@@ -68,9 +62,13 @@ pub struct P2PArgs {
     #[clap(long = "max-block-size", default_value = MAX_RESPONSE_SIZE_STR, env)]
     pub max_block_size: usize,
 
-    /// Max number of headers in a single headers request response
+    /// Max number of blocks/headers in a single headers request response
     #[clap(long = "max-headers-per-request", default_value = "100", env)]
-    pub max_headers_per_request: u32,
+    pub max_headers_per_request: usize,
+
+    /// Max number of txs in a single txs request response
+    #[clap(long = "max-txs-per-request", default_value = "10000", env)]
+    pub max_txs_per_request: usize,
 
     /// Addresses of the bootstrap nodes
     /// They should contain PeerId within their `Multiaddr`
@@ -82,7 +80,7 @@ pub struct P2PArgs {
     #[clap(long = "reserved-nodes", value_delimiter = ',', env)]
     pub reserved_nodes: Vec<Multiaddr>,
 
-    /// With this set to `true` you create a guarded node that is only ever connected to trusted, reserved nodes.    
+    /// With this set to `true` you create a guarded node that is only ever connected to trusted, reserved nodes.
     #[clap(long = "reserved-nodes-only-mode", env)]
     pub reserved_nodes_only_mode: bool,
 
@@ -117,7 +115,7 @@ pub struct P2PArgs {
     #[clap(long = "connection-idle-timeout", default_value = "120", env)]
     pub connection_idle_timeout: u64,
 
-    /// Choose how often to recieve PeerInfo from other nodes
+    /// Choose how often to receive PeerInfo from other nodes
     #[clap(long = "info-interval", default_value = "3", env)]
     pub info_interval: u64,
 
@@ -146,9 +144,9 @@ pub struct P2PArgs {
     #[clap(long = "history-gossip", default_value = "3", env)]
     pub history_gossip: usize,
 
-    /// Time between each gossipsub heartbeat
-    #[clap(long = "gossip-heartbeat-interval", default_value = "1", env)]
-    pub gossip_heartbeat_interval: u64,
+    /// Time between each gossipsub heartbeat, in milliseconds
+    #[clap(long = "gossip-heartbeat-interval", default_value = "500ms", env)]
+    pub gossip_heartbeat_interval: humantime::Duration,
 
     /// The maximum byte size for each gossip (default is 18 MiB)
     #[clap(long = "max-transmit-size", default_value = MAX_RESPONSE_SIZE_STR, env)]
@@ -157,6 +155,10 @@ pub struct P2PArgs {
     /// Choose timeout for sent requests in RequestResponse protocol
     #[clap(long = "request-timeout", default_value = "20", env)]
     pub request_timeout: u64,
+
+    /// Choose max concurrent streams for RequestResponse protocol
+    #[clap(long = "request-max-concurrent-streams", default_value = "256", env)]
+    pub max_concurrent_streams: usize,
 
     /// Choose how long RequestResponse protocol connections will live if idle
     #[clap(long = "connection-keep-alive", default_value = "20", env)]
@@ -187,6 +189,14 @@ pub struct P2PArgs {
     /// For peer reputations, the maximum time since last heartbeat before penalty
     #[clap(long = "heartbeat-max-time-since-last", default_value = "40", env)]
     pub heartbeat_max_time_since_last: u64,
+
+    /// Number of threads to read from the database.
+    #[clap(long = "p2p-database-read-threads", default_value = "2", env)]
+    pub database_read_threads: usize,
+
+    /// Number of threads to read from the tx pool.
+    #[clap(long = "p2p-txpool-threads", default_value = "0", env)]
+    pub tx_pool_threads: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -216,7 +226,13 @@ impl KeypairArg {
         }
         let path = PathBuf::from_str(s);
         if let Ok(pathbuf) = path {
-            return Ok(KeypairArg::Path(pathbuf))
+            if pathbuf.exists() {
+                return Ok(KeypairArg::Path(pathbuf))
+            } else {
+                return Err(anyhow!(
+                    "path `{pathbuf:?}` does not exist for keypair argument"
+                ))
+            }
         }
         Err(anyhow!(
             "invalid keypair argument, neither a valid key or path"
@@ -228,7 +244,7 @@ impl From<SyncArgs> for fuel_core::sync::Config {
     fn from(value: SyncArgs) -> Self {
         Self {
             block_stream_buffer_size: value.block_stream_buffer_size,
-            header_batch_size: value.header_batch_size,
+            header_batch_size: value.header_batch_size as usize,
         }
     }
 }
@@ -236,6 +252,7 @@ impl From<SyncArgs> for fuel_core::sync::Config {
 impl P2PArgs {
     pub fn into_config(
         self,
+        network_name: String,
         metrics: bool,
     ) -> anyhow::Result<Option<Config<NotInitialized>>> {
         if !self.enable_p2p {
@@ -267,7 +284,7 @@ impl P2PArgs {
             .mesh_n_high(self.max_mesh_size)
             .history_length(self.history_length)
             .history_gossip(self.history_gossip)
-            .heartbeat_interval(Duration::from_secs(self.gossip_heartbeat_interval))
+            .heartbeat_interval(self.gossip_heartbeat_interval.into())
             .max_transmit_size(self.max_transmit_size)
             .build()
             .expect("valid gossipsub configuration");
@@ -281,7 +298,7 @@ impl P2PArgs {
         let heartbeat_config = {
             let send_duration = Duration::from_secs(self.heartbeat_send_duration);
             let idle_duration = Duration::from_secs(self.heartbeat_idle_duration);
-            HeartbeatConfig::new(
+            heartbeat::Config::new(
                 send_duration,
                 idle_duration,
                 self.heartbeat_max_failures,
@@ -290,7 +307,7 @@ impl P2PArgs {
 
         let config = Config {
             keypair: local_keypair,
-            network_name: self.network.expect("mandatory value"),
+            network_name,
             checksum: Default::default(),
             address: self
                 .address
@@ -299,6 +316,7 @@ impl P2PArgs {
             tcp_port: self.peering_port,
             max_block_size: self.max_block_size,
             max_headers_per_request: self.max_headers_per_request,
+            max_txs_per_request: self.max_txs_per_request,
             bootstrap_nodes: self.bootstrap_nodes,
             reserved_nodes: self.reserved_nodes,
             reserved_nodes_only_mode: self.reserved_nodes_only_mode,
@@ -313,6 +331,7 @@ impl P2PArgs {
             gossipsub_config,
             heartbeat_config,
             set_request_timeout: Duration::from_secs(self.request_timeout),
+            max_concurrent_streams: self.max_concurrent_streams,
             set_connection_keep_alive: Duration::from_secs(self.connection_keep_alive),
             heartbeat_check_interval: Duration::from_secs(self.heartbeat_check_interval),
             heartbeat_max_avg_interval: Duration::from_secs(
@@ -324,8 +343,29 @@ impl P2PArgs {
             info_interval: Some(Duration::from_secs(self.info_interval)),
             identify_interval: Some(Duration::from_secs(self.identify_interval)),
             metrics,
+            database_read_threads: self.database_read_threads,
+            tx_pool_threads: self.tx_pool_threads,
             state: NotInitialized,
         };
         Ok(Some(config))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_invalid_path() {
+        // Given
+        let invalid_path = "/invalid/path/to/keypair";
+        // When
+        let keypair = KeypairArg::try_from_string(invalid_path);
+
+        // Then
+        let err = keypair.expect_err("The path is incorrect it should fail");
+        assert!(err
+            .to_string()
+            .contains("does not exist for keypair argument"));
     }
 }

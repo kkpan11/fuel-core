@@ -6,14 +6,28 @@ use crate::{
         SealedBlock,
     },
     services::{
-        executor::TransactionExecutionStatus,
+        executor::{
+            Event,
+            TransactionExecutionStatus,
+        },
         Uncommitted,
     },
 };
+use core::ops::Deref;
+
+#[cfg(feature = "std")]
+use std::sync::Arc;
+
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
 
 /// The uncommitted result of the block importing.
 pub type UncommittedResult<DatabaseTransaction> =
     Uncommitted<ImportResult, DatabaseTransaction>;
+
+#[cfg(feature = "std")]
+/// The alias for the `ImportResult` that can be shared between threads.
+pub type SharedImportResult = Arc<dyn Deref<Target = ImportResult> + Send + Sync>;
 
 /// The result of the block import.
 #[derive(Debug)]
@@ -23,8 +37,18 @@ pub struct ImportResult {
     pub sealed_block: SealedBlock,
     /// The status of the transactions execution included into the block.
     pub tx_status: Vec<TransactionExecutionStatus>,
+    /// The events produced during block execution.
+    pub events: Vec<Event>,
     /// The source producer of the block.
     pub source: Source,
+}
+
+impl Deref for ImportResult {
+    type Target = Self;
+
+    fn deref(&self) -> &Self::Target {
+        self
+    }
 }
 
 /// The source producer of the block.
@@ -42,10 +66,12 @@ impl ImportResult {
     pub fn new_from_local(
         sealed_block: SealedBlock,
         tx_status: Vec<TransactionExecutionStatus>,
+        events: Vec<Event>,
     ) -> Self {
         Self {
             sealed_block,
             tx_status,
+            events,
             source: Source::Local,
         }
     }
@@ -54,10 +80,12 @@ impl ImportResult {
     pub fn new_from_network(
         sealed_block: SealedBlock,
         tx_status: Vec<TransactionExecutionStatus>,
+        events: Vec<Event>,
     ) -> Self {
         Self {
             sealed_block,
             tx_status,
+            events,
             source: Source::Network,
         }
     }
@@ -87,8 +115,9 @@ impl BlockImportInfo {
     }
 }
 
-impl From<&ImportResult> for BlockImportInfo {
-    fn from(result: &ImportResult) -> Self {
+#[cfg(feature = "std")]
+impl From<SharedImportResult> for BlockImportInfo {
+    fn from(result: SharedImportResult) -> Self {
         Self {
             block_header: result.sealed_block.entity.header().clone(),
             source: result.source,

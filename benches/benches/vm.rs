@@ -1,4 +1,7 @@
-mod set;
+mod contract;
+mod utils;
+mod vm_initialization;
+mod vm_set;
 
 use criterion::{
     black_box,
@@ -8,12 +11,15 @@ use criterion::{
     BenchmarkGroup,
     Criterion,
 };
-use std::time::Duration;
+use std::sync::Arc;
 
+use crate::vm_initialization::vm_initialization;
+use contract::*;
+use fuel_core::database::GenesisDatabase;
 use fuel_core_benches::*;
-use fuel_core_storage::transactional::Transaction;
+use fuel_core_storage::transactional::IntoTransaction;
 use fuel_core_types::fuel_asm::Instruction;
-use set::*;
+use vm_set::*;
 
 // Use Jemalloc during benchmarks
 #[global_allocator]
@@ -31,44 +37,73 @@ where
                 instruction,
                 diff,
             } = &mut i;
-            let original_db = vm.as_mut().database_mut().clone();
-            let mut db_txn = {
-                let db = vm.as_mut().database_mut();
-                let db_txn = db.transaction();
-                // update vm database in-place to use transaction
-                *db = db_txn.as_ref().clone();
-                db_txn
-            };
 
-            let mut elapsed_time = Duration::default();
+            let clock = quanta::Clock::new();
+
+            let original_db = vm.as_mut().database_mut().clone();
+            // During block production/validation for each state, which may affect the state of the database,
+            // we create a new storage transaction. The code here simulates the same behavior to have
+            // the same nesting level and the same performance.
+            let block_database_tx = original_db.clone().into_transaction();
+            let relayer_database_tx = block_database_tx.into_transaction();
+            let tx_database_tx = relayer_database_tx.into_transaction();
+            let database = GenesisDatabase::new(Arc::new(tx_database_tx));
+            *vm.as_mut().database_mut() = database.into_transaction();
+
+            let mut total = core::time::Duration::ZERO;
             for _ in 0..iters {
-                let start = std::time::Instant::now();
+                let start = black_box(clock.raw());
                 match instruction {
                     Instruction::CALL(call) => {
                         let (ra, rb, rc, rd) = call.unpack();
-                        vm.prepare_call(ra, rb, rc, rd).unwrap();
+                        black_box(vm.prepare_call(ra, rb, rc, rd)).unwrap();
                     }
                     _ => {
                         black_box(vm.instruction(*instruction).unwrap());
                     }
                 }
-                elapsed_time += start.elapsed();
+                black_box(&vm);
+                let end = black_box(clock.raw());
+                total += clock.delta(start, end);
                 vm.reset_vm_state(diff);
+                // Reset database changes.
+                vm.as_mut().database_mut().reset_changes();
             }
-            db_txn.commit().unwrap();
-            // restore original db
             *vm.as_mut().database_mut() = original_db;
-            elapsed_time
+            total
         })
     });
 }
+
 fn vm(c: &mut Criterion) {
     alu::run(c);
-    blockchain::run(c);
     crypto::run(c);
     flow::run(c);
     mem::run(c);
+    blockchain::run(c);
+    contract_root(c);
+    state_root(c);
+    vm_initialization(c);
 }
 
 criterion_group!(benches, vm);
 criterion_main!(benches);
+
+// If you want to debug the benchmarks, you can run them with code below:
+// But first you need to comment `criterion_group` and `criterion_main` macros above.
+//
+// fn main() {
+//     let criterio = Criterion::default();
+//     let mut criterio = criterio.with_filter("vm_initialization");
+//     alu::run(&mut criterio);
+//     crypto::run(&mut criterio);
+//     flow::run(&mut criterio);
+//     mem::run(&mut criterio);
+//     blockchain::run(&mut criterio);
+//     contract_root(&mut criterio);
+//     state_root(&mut criterio);
+//     vm_initialization(&mut criterio);
+// }
+//
+// #[test]
+// fn dummy() {}

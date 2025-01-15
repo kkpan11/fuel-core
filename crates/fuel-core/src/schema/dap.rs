@@ -1,11 +1,16 @@
 use crate::{
     database::{
-        transaction::DatabaseTransaction,
-        vm_database::VmDatabase,
+        database_description::on_chain::OnChain,
         Database,
+        OnChainIterableKeyValueView,
     },
-    schema::scalars::U64,
+    fuel_core_graphql_api::api_service::ConsensusProvider,
+    schema::scalars::{
+        U32,
+        U64,
+    },
 };
+use anyhow::anyhow;
 use async_graphql::{
     Context,
     Object,
@@ -14,6 +19,12 @@ use async_graphql::{
 };
 use fuel_core_storage::{
     not_found,
+    transactional::{
+        AtomicView,
+        IntoTransaction,
+        StorageTransaction,
+    },
+    vm_storage::VmStorage,
     InterpreterStorage,
 };
 use fuel_core_types::{
@@ -23,19 +34,27 @@ use fuel_core_types::{
         Word,
     },
     fuel_tx::{
-        Buildable,
+        field::{
+            Policies,
+            ScriptGasLimit,
+            Witnesses,
+        },
+        policies::PolicyType,
         ConsensusParameters,
         Executable,
         Script,
         Transaction,
     },
-    fuel_types::Address,
     fuel_vm::{
         checked_transaction::{
             CheckedTransaction,
             IntoChecked,
         },
-        consts,
+        interpreter::{
+            InterpreterParams,
+            MemoryInstance,
+        },
+        state::DebugEval,
         Interpreter,
         InterpreterError,
     },
@@ -45,6 +64,7 @@ use std::{
     collections::HashMap,
     io,
     sync,
+    sync::Arc,
 };
 use tracing::{
     debug,
@@ -52,27 +72,27 @@ use tracing::{
 };
 use uuid::Uuid;
 
-use fuel_core_types::fuel_vm::state::DebugEval;
-
 pub struct Config {
     /// `true` means that debugger functionality is enabled.
     debug_enabled: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+type FrozenDatabase = VmStorage<StorageTransaction<OnChainIterableKeyValueView>>;
+
+#[derive(Default, Debug)]
 pub struct ConcreteStorage {
-    vm: HashMap<ID, Interpreter<VmDatabase, Script>>,
+    vm: HashMap<ID, Interpreter<MemoryInstance, FrozenDatabase, Script>>,
     tx: HashMap<ID, Vec<Script>>,
-    db: HashMap<ID, DatabaseTransaction>,
-    params: ConsensusParameters,
 }
 
+/// The gas price used for transactions in the debugger. It is set to 0 because
+/// the debugger does not actually execute transactions, but only simulates
+/// their execution.
+const GAS_PRICE: u64 = 0;
+
 impl ConcreteStorage {
-    pub fn new(params: ConsensusParameters) -> Self {
-        Self {
-            params,
-            ..Default::default()
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn register(&self, id: &ID, register: RegisterId) -> Option<Word> {
@@ -82,27 +102,25 @@ impl ConcreteStorage {
     }
 
     pub fn memory(&self, id: &ID, start: usize, size: usize) -> Option<&[u8]> {
-        let (end, overflow) = start.overflowing_add(size);
-        if overflow || end > consts::VM_MAX_RAM as usize {
-            return None
-        }
-
-        self.vm.get(id).map(|vm| &vm.memory()[start..end])
+        self.vm
+            .get(id)
+            .and_then(|vm| vm.memory().read(start, size).ok())
     }
 
     pub fn init(
         &mut self,
         txs: &[Script],
-        storage: DatabaseTransaction,
+        params: Arc<ConsensusParameters>,
+        storage: &Database<OnChain>,
     ) -> anyhow::Result<ID> {
         let id = Uuid::new_v4();
         let id = ID::from(id);
 
-        let vm_database = Self::vm_database(&storage)?;
-        let tx = Self::dummy_tx();
+        let vm_database = Self::vm_database(storage)?;
+        let tx = Self::dummy_tx(params.tx_params().max_gas_per_tx() / 2);
         let checked_tx = tx
-            .into_checked_basic(vm_database.block_height()?, &self.params)
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .into_checked_basic(vm_database.block_height()?, &params)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         self.tx
             .get_mut(&id)
             .map(|tx| tx.extend_from_slice(txs))
@@ -110,39 +128,79 @@ impl ConcreteStorage {
                 self.tx.insert(id.clone(), txs.to_owned());
             });
 
-        let mut vm = Interpreter::with_storage(vm_database, (&self.params).into());
-        vm.transact(checked_tx).map_err(|e| anyhow::anyhow!(e))?;
+        let gas_costs = params.gas_costs();
+        let fee_params = params.fee_params();
+
+        let ready_tx = checked_tx
+            .into_ready(
+                GAS_PRICE,
+                gas_costs,
+                fee_params,
+                Some(vm_database.block_height()?),
+            )
+            .map_err(|e| {
+                anyhow!("Failed to apply dynamic values to checked tx: {:?}", e)
+            })?;
+
+        let interpreter_params = InterpreterParams::new(GAS_PRICE, params.as_ref());
+        let mut vm = Interpreter::with_storage(
+            MemoryInstance::new(),
+            vm_database,
+            interpreter_params,
+        );
+        vm.transact(ready_tx).map_err(|e| anyhow::anyhow!(e))?;
         self.vm.insert(id.clone(), vm);
-        self.db.insert(id.clone(), storage);
 
         Ok(id)
     }
 
     pub fn kill(&mut self, id: &ID) -> bool {
         self.tx.remove(id);
-        self.vm.remove(id);
-        self.db.remove(id).is_some()
+        self.vm.remove(id).is_some()
     }
 
-    pub fn reset(&mut self, id: &ID, storage: DatabaseTransaction) -> anyhow::Result<()> {
-        let vm_database = Self::vm_database(&storage)?;
+    pub fn reset(
+        &mut self,
+        id: &ID,
+        params: Arc<ConsensusParameters>,
+        storage: &Database<OnChain>,
+    ) -> anyhow::Result<()> {
+        let vm_database = Self::vm_database(storage)?;
         let tx = self
             .tx
             .get(id)
             .and_then(|tx| tx.first())
             .cloned()
-            .unwrap_or(Self::dummy_tx());
+            .unwrap_or(Self::dummy_tx(params.tx_params().max_gas_per_tx() / 2));
 
         let checked_tx = tx
-            .into_checked_basic(vm_database.block_height()?, &self.params)
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .into_checked_basic(vm_database.block_height()?, &params)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
-        let mut vm = Interpreter::with_storage(vm_database, (&self.params).into());
-        vm.transact(checked_tx).map_err(|e| anyhow::anyhow!(e))?;
+        let gas_costs = params.gas_costs();
+        let fee_params = params.fee_params();
+
+        let ready_tx = checked_tx
+            .into_ready(
+                GAS_PRICE,
+                gas_costs,
+                fee_params,
+                Some(vm_database.block_height()?),
+            )
+            .map_err(|e| {
+                anyhow!("Failed to apply dynamic values to checked tx: {:?}", e)
+            })?;
+
+        let interpreter_params = InterpreterParams::new(GAS_PRICE, params.as_ref());
+        let mut vm = Interpreter::with_storage(
+            MemoryInstance::new(),
+            vm_database,
+            interpreter_params,
+        );
+        vm.transact(ready_tx).map_err(|e| anyhow::anyhow!(e))?;
         self.vm.insert(id.clone(), vm).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "The VM instance was not found")
         })?;
-        self.db.insert(id.clone(), storage);
         Ok(())
     }
 
@@ -156,25 +214,27 @@ impl ConcreteStorage {
             .ok_or_else(|| anyhow::anyhow!("The VM instance was not found"))
     }
 
-    fn vm_database(storage: &DatabaseTransaction) -> anyhow::Result<VmDatabase> {
-        let block = storage
+    fn vm_database(storage: &Database<OnChain>) -> anyhow::Result<FrozenDatabase> {
+        let view = storage.latest_view()?;
+        let block = view
             .get_current_block()?
-            .ok_or(not_found!("Block for VMDatabase"))?
-            .into_owned();
+            .ok_or(not_found!("Block for VMDatabase"))?;
 
-        let vm_database = VmDatabase::new(
-            storage.as_ref().clone(),
-            &block.header().consensus,
+        let vm_database = VmStorage::new(
+            view.into_transaction(),
+            block.header().consensus(),
+            block.header().application(),
             // TODO: Use a real coinbase address
-            Address::zeroed(),
+            Default::default(),
         );
 
         Ok(vm_database)
     }
 
-    fn dummy_tx() -> Script {
+    fn dummy_tx(gas_limit: u64) -> Script {
         // Create `Script` transaction with dummy coin
         let mut tx = Script::default();
+        *tx.script_gas_limit_mut() = gas_limit;
         tx.add_unsigned_coin_input(
             Default::default(),
             &Default::default(),
@@ -182,9 +242,9 @@ impl ConcreteStorage {
             Default::default(),
             Default::default(),
             Default::default(),
-            Default::default(),
         );
-        tx.add_witness(vec![].into());
+        tx.witnesses_mut().push(vec![].into());
+        tx.policies_mut().set(PolicyType::MaxFee, Some(0));
         tx
     }
 }
@@ -198,11 +258,10 @@ pub struct DapMutation;
 
 pub fn init<Q, M, S>(
     schema: SchemaBuilder<Q, M, S>,
-    params: ConsensusParameters,
     debug_enabled: bool,
 ) -> SchemaBuilder<Q, M, S> {
     schema
-        .data(GraphStorage::new(Mutex::new(ConcreteStorage::new(params))))
+        .data(GraphStorage::new(Mutex::new(ConcreteStorage::new())))
         .data(Config { debug_enabled })
 }
 
@@ -218,11 +277,12 @@ fn require_debug(ctx: &Context<'_>) -> async_graphql::Result<()> {
 
 #[Object]
 impl DapQuery {
+    /// Read register value by index.
     async fn register(
         &self,
         ctx: &Context<'_>,
         id: ID,
-        register: U64,
+        register: U32,
     ) -> async_graphql::Result<U64> {
         require_debug(ctx)?;
         ctx.data_unchecked::<GraphStorage>()
@@ -233,12 +293,13 @@ impl DapQuery {
             .map(|val| val.into())
     }
 
+    /// Read read a range of memory bytes.
     async fn memory(
         &self,
         ctx: &Context<'_>,
         id: ID,
-        start: U64,
-        size: U64,
+        start: U32,
+        size: U32,
     ) -> async_graphql::Result<String> {
         require_debug(ctx)?;
         ctx.data_unchecked::<GraphStorage>()
@@ -252,23 +313,31 @@ impl DapQuery {
 
 #[Object]
 impl DapMutation {
+    /// Initialize a new debugger session, returning its ID.
+    /// A new VM instance is spawned for each session.
+    /// The session is run in a separate database transaction,
+    /// on top of the most recent node state.
     async fn start_session(&self, ctx: &Context<'_>) -> async_graphql::Result<ID> {
         require_debug(ctx)?;
         trace!("Initializing new interpreter");
 
         let db = ctx.data_unchecked::<Database>();
+        let params = ctx
+            .data_unchecked::<ConsensusProvider>()
+            .latest_consensus_params();
 
-        let id = ctx
-            .data_unchecked::<GraphStorage>()
-            .lock()
-            .await
-            .init(&[], db.transaction())?;
+        let id =
+            ctx.data_unchecked::<GraphStorage>()
+                .lock()
+                .await
+                .init(&[], params, db)?;
 
         debug!("Session {:?} initialized", id);
 
         Ok(id)
     }
 
+    /// End debugger session.
     async fn end_session(
         &self,
         ctx: &Context<'_>,
@@ -282,20 +351,25 @@ impl DapMutation {
         Ok(existed)
     }
 
+    /// Reset the VM instance to the initial state.
     async fn reset(&self, ctx: &Context<'_>, id: ID) -> async_graphql::Result<bool> {
         require_debug(ctx)?;
         let db = ctx.data_unchecked::<Database>();
+        let params = ctx
+            .data_unchecked::<ConsensusProvider>()
+            .latest_consensus_params();
 
         ctx.data_unchecked::<GraphStorage>()
             .lock()
             .await
-            .reset(&id, db.transaction())?;
+            .reset(&id, params, db)?;
 
         debug!("Session {:?} was reset", id);
 
         Ok(true)
     }
 
+    /// Execute a single fuel-asm instruction.
     async fn execute(
         &self,
         ctx: &Context<'_>,
@@ -317,6 +391,7 @@ impl DapMutation {
         Ok(result)
     }
 
+    /// Set single-stepping mode for the VM instance.
     async fn set_single_stepping(
         &self,
         ctx: &Context<'_>,
@@ -336,6 +411,7 @@ impl DapMutation {
         Ok(enable)
     }
 
+    /// Set a breakpoint for a VM instance.
     async fn set_breakpoint(
         &self,
         ctx: &Context<'_>,
@@ -343,7 +419,7 @@ impl DapMutation {
         breakpoint: gql_types::Breakpoint,
     ) -> async_graphql::Result<bool> {
         require_debug(ctx)?;
-        trace!("Continue execution of VM {:?}", id);
+        trace!("Set breakpoint for VM {:?}", id);
 
         let mut locked = ctx.data_unchecked::<GraphStorage>().lock().await;
         let vm = locked
@@ -355,6 +431,8 @@ impl DapMutation {
         Ok(true)
     }
 
+    /// Run a single transaction in given session until it
+    /// hits a breakpoint or completes.
     async fn start_tx(
         &self,
         ctx: &Context<'_>,
@@ -368,21 +446,36 @@ impl DapMutation {
             .map_err(|_| async_graphql::Error::new("Invalid transaction JSON"))?;
 
         let mut locked = ctx.data_unchecked::<GraphStorage>().lock().await;
-
-        let db = locked.db.get(&id).ok_or("Invalid debugging session ID")?;
-
-        let checked_tx = tx
-            .into_checked_basic(db.latest_height()?, &locked.params)?
-            .into();
+        let params = ctx
+            .data_unchecked::<ConsensusProvider>()
+            .latest_consensus_params();
 
         let vm = locked
             .vm
             .get_mut(&id)
             .ok_or_else(|| async_graphql::Error::new("VM not found"))?;
 
+        let checked_tx = tx
+            .into_checked_basic(vm.as_ref().block_height()?, &params)
+            .map_err(|err| anyhow::anyhow!("{:?}", err))?
+            .into();
+
+        let gas_costs = params.gas_costs();
+        let fee_params = params.fee_params();
+
         match checked_tx {
             CheckedTransaction::Script(script) => {
-                let state_ref = vm.transact(script).map_err(|err| {
+                let ready_tx = script
+                    .into_ready(
+                        GAS_PRICE,
+                        gas_costs,
+                        fee_params,
+                        Some(vm.as_ref().block_height()?),
+                    )
+                    .map_err(|e| {
+                        anyhow!("Failed to apply dynamic values to checked tx: {:?}", e)
+                    })?;
+                let state_ref = vm.transact(ready_tx).map_err(|err| {
                     async_graphql::Error::new(format!("Transaction failed: {err:?}"))
                 })?;
 
@@ -407,25 +500,26 @@ impl DapMutation {
                     json_receipts,
                 })
             }
-            CheckedTransaction::Create(create) => {
-                vm.deploy(create).map_err(|err| {
-                    async_graphql::Error::new(format!(
-                        "Transaction deploy failed: {err:?}"
-                    ))
-                })?;
-
-                Ok(gql_types::RunResult {
-                    state: gql_types::RunState::Completed,
-                    breakpoint: None,
-                    json_receipts: vec![],
-                })
+            CheckedTransaction::Create(_) => {
+                Err(async_graphql::Error::new("`Create` is not supported"))
             }
             CheckedTransaction::Mint(_) => {
                 Err(async_graphql::Error::new("`Mint` is not supported"))
             }
+            CheckedTransaction::Upgrade(_) => {
+                Err(async_graphql::Error::new("`Upgrade` is not supported"))
+            }
+            CheckedTransaction::Upload(_) => {
+                Err(async_graphql::Error::new("`Upload` is not supported"))
+            }
+            CheckedTransaction::Blob(_) => {
+                Err(async_graphql::Error::new("`Blob` is not supported"))
+            }
         }
     }
 
+    /// Resume execution of the VM instance after a breakpoint.
+    /// Runs until the next breakpoint or until the transaction completes.
     async fn continue_tx(
         &self,
         ctx: &Context<'_>,
@@ -492,6 +586,7 @@ mod gql_types {
 
     use fuel_core_types::fuel_vm::Breakpoint as FuelBreakpoint;
 
+    /// Breakpoint, defined as a tuple of contract ID and relative PC offset inside it
     #[derive(Debug, Clone, Copy, InputObject)]
     pub struct Breakpoint {
         contract: ContractId,

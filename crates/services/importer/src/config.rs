@@ -4,11 +4,17 @@ pub struct Config {
     pub metrics: bool,
 }
 
-impl Default for Config {
-    fn default() -> Self {
+impl Config {
+    pub fn new(metrics: bool) -> Self {
         Self {
             max_block_notify_buffer: 1 << 10,
-            metrics: false,
+            metrics,
         }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::new(false)
     }
 }

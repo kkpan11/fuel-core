@@ -2,9 +2,14 @@
 //! This module contains the import task which is responsible for
 //! importing blocks from the network into the local blockchain.
 
+use cache::{
+    Cache,
+    CachedDataBatch,
+};
 use fuel_core_services::{
     SharedMutex,
     StateWatcher,
+    TraceErr,
 };
 use fuel_core_types::{
     self,
@@ -27,13 +32,21 @@ use futures::{
 };
 use std::{
     future::Future,
+    num::NonZeroU32,
     ops::{
         Range,
         RangeInclusive,
     },
     sync::Arc,
 };
-use tokio::sync::Notify;
+use tokio::{
+    pin,
+    sync::{
+        mpsc,
+        Notify,
+    },
+    task::JoinHandle,
+};
 use tracing::Instrument;
 
 use crate::{
@@ -44,8 +57,9 @@ use crate::{
         PeerToPeerPort,
     },
     state::State,
-    tracing_helpers::TraceErr,
 };
+
+mod cache;
 
 #[cfg(any(test, feature = "benchmarking"))]
 /// Accessories for testing the sync. Available only when compiling under test
@@ -64,7 +78,7 @@ pub struct Config {
     /// The maximum number of get transaction requests to make in a single batch.
     pub block_stream_buffer_size: usize,
     /// The maximum number of headers to request in a single batch.
-    pub header_batch_size: u32,
+    pub header_batch_size: usize,
 }
 
 impl Default for Config {
@@ -91,6 +105,17 @@ pub struct Import<P, E, C> {
     executor: Arc<E>,
     /// Consensus port.
     consensus: Arc<C>,
+    /// A cache of already validated header or blocks.
+    cache: Cache,
+}
+
+/// The data that is fetched either in the network or in the cache for a range of headers or blocks.
+#[derive(Debug, Clone)]
+enum BlockHeaderData {
+    /// The headers (or full blocks) have been fetched and checked.
+    Cached(CachedDataBatch),
+    /// The headers has just been fetched from the network.
+    Fetched(Batch<SealedBlockHeader>),
 }
 
 impl<P, E, C> Import<P, E, C> {
@@ -111,6 +136,7 @@ impl<P, E, C> Import<P, E, C> {
             p2p,
             executor,
             consensus,
+            cache: Cache::new(),
         }
     }
 
@@ -120,15 +146,15 @@ impl<P, E, C> Import<P, E, C> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Batch<T> {
-    peer: PeerId,
+    peer: Option<PeerId>,
     range: Range<u32>,
     results: Vec<T>,
 }
 
 impl<T> Batch<T> {
-    pub fn new(peer: PeerId, range: Range<u32>, results: Vec<T>) -> Self {
+    pub fn new(peer: Option<PeerId>, range: Range<u32>, results: Vec<T>) -> Self {
         Self {
             peer,
             range,
@@ -152,33 +178,127 @@ where
 {
     #[tracing::instrument(skip_all)]
     /// Execute imports until a shutdown is requested.
-    pub async fn import(&self, shutdown: &mut StateWatcher) -> anyhow::Result<bool> {
+    pub async fn import(&mut self, shutdown: &mut StateWatcher) -> anyhow::Result<bool> {
         self.import_inner(shutdown).await?;
 
         Ok(wait_for_notify_or_shutdown(&self.notify, shutdown).await)
     }
 
-    async fn import_inner(&self, shutdown: &StateWatcher) -> anyhow::Result<()> {
+    async fn import_inner(&mut self, shutdown: &StateWatcher) -> anyhow::Result<()> {
         // If there is a range to process, launch the stream.
         if let Some(range) = self.state.apply(|s| s.process_range()) {
             // Launch the stream to import the range.
             let count = self.launch_stream(range.clone(), shutdown).await;
 
             // Get the size of the range.
-            let range_len = range.size_hint().0 as u32;
+            let range_len = range.size_hint().0;
 
             // If we did not process the entire range, mark the failed heights as failed.
-            if (count as u32) < range_len {
-                let incomplete_range = (*range.start() + count as u32)..=*range.end();
+            if count < range_len {
+                let count = u32::try_from(count)
+                    .expect("Size of the range can't be more than maximum `BlockHeight`");
+                let incomplete_range = range.start().saturating_add(count)..=*range.end();
                 self.state
                     .apply(|s| s.failed_to_process(incomplete_range.clone()));
-                Err(anyhow::anyhow!(
+                return Err(anyhow::anyhow!(
                     "Failed to import range of blocks: {:?}",
                     incomplete_range
-                ))?;
+                ));
             }
         }
         Ok(())
+    }
+
+    fn fetch_batches_task(
+        &self,
+        range: RangeInclusive<u32>,
+        shutdown: &StateWatcher,
+    ) -> (JoinHandle<()>, mpsc::Receiver<SealedBlockBatch>) {
+        let Self {
+            params,
+            p2p,
+            consensus,
+            cache,
+            ..
+        } = &self;
+        let batch_size = u32::try_from(params.header_batch_size)
+            .expect("Header batch size must be less u32::MAX");
+        let batch_size =
+            NonZeroU32::new(batch_size).expect("Header batch size must be non-zero");
+
+        let (batch_sender, batch_receiver) = mpsc::channel(1);
+
+        let fetch_batches_task = tokio::spawn({
+            let params = *params;
+            let p2p = p2p.clone();
+            let consensus = consensus.clone();
+            let cache = cache.clone();
+            let block_stream_buffer_size = params.block_stream_buffer_size;
+            let mut shutdown_signal = shutdown.clone();
+            async move {
+                let block_stream = get_block_stream(
+                    range.clone(),
+                    batch_size,
+                    p2p,
+                    consensus,
+                    cache.clone(),
+                );
+
+                let shutdown_future = {
+                    let mut s = shutdown_signal.clone();
+                    async move {
+                        let _ = s.while_started().await;
+                        tracing::info!("In progress import stream shutting down");
+                    }
+                };
+
+                let stream = block_stream
+                    .map({
+                        let shutdown_signal = shutdown_signal.clone();
+                        move |stream_block_batch| {
+                            let mut shutdown_signal = shutdown_signal.clone();
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    biased;
+                                    // If a shutdown signal is received during the stream, terminate early and
+                                    // return an empty response
+                                    _ = shutdown_signal.while_started() => None,
+                                    // Stream a batch of blocks
+                                    blocks = stream_block_batch => Some(blocks),
+                                }
+                            }).map(|task| {
+                                task.trace_err("Failed to join the task").ok().flatten()
+                            })
+                        }
+                    })
+                    // Request up to `block_stream_buffer_size` headers/transactions from the network.
+                    .buffered(block_stream_buffer_size)
+                    // Continue the stream until the shutdown signal is received.
+                    .take_until(shutdown_future)
+                    .into_scan_none()
+                    .scan_none()
+                    .into_scan_err()
+                    .scan_err();
+
+                pin!(stream);
+
+                while let Some(block_batch) = stream.next().await {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_signal.while_started() => {
+                            break;
+                        },
+                        result = batch_sender.send(block_batch) => {
+                            if result.is_err() {
+                                break
+                            }
+                        },
+                    }
+                }
+            }
+        });
+
+        (fetch_batches_task, batch_receiver)
     }
 
     #[tracing::instrument(skip(self, shutdown))]
@@ -189,59 +309,22 @@ where
     /// If an error occurs, the preceding blocks still be processed
     /// and the error will be returned.
     async fn launch_stream(
-        &self,
+        &mut self,
         range: RangeInclusive<u32>,
         shutdown: &StateWatcher,
     ) -> usize {
         let Self {
             state,
-            params,
             p2p,
             executor,
-            consensus,
             ..
         } = &self;
 
-        let shutdown_signal = shutdown.clone();
-        let (shutdown_guard, mut shutdown_guard_recv) =
-            tokio::sync::mpsc::channel::<()>(1);
-
-        let block_stream =
-            get_block_stream(range.clone(), params, p2p.clone(), consensus.clone());
-        let result = block_stream
-            .map(move |stream_block_batch| {
-                let shutdown_guard = shutdown_guard.clone();
-                let shutdown_signal = shutdown_signal.clone();
-                tokio::spawn(async move {
-                    // Hold a shutdown sender for the lifetime of the spawned task
-                    let _shutdown_guard = shutdown_guard.clone();
-                    let mut shutdown_signal = shutdown_signal.clone();
-                    tokio::select! {
-                    // Stream a batch of blocks
-                    blocks = stream_block_batch => Some(blocks),
-                    // If a shutdown signal is received during the stream, terminate early and
-                    // return an empty response
-                    _ = shutdown_signal.while_started() => None
-                }
-                }).map(|task| {
-                    task.trace_err("Failed to join the task").ok().flatten()
-                })
-            })
-            // Request up to `block_stream_buffer_size` transactions from the network.
-            .buffered(params.block_stream_buffer_size)
-            // Continue the stream until the shutdown signal is received.
-            .take_until({
-                let mut s = shutdown.clone();
-                async move {
-                    let _ = s.while_started().await;
-                    tracing::info!("In progress import stream shutting down");
-                }
-            })
-            .into_scan_none()
-            .scan_none()
-            .into_scan_err()
-            .scan_err()
+        let (fetch_batches_task, batch_receiver) =
+            self.fetch_batches_task(range, shutdown);
+        let result = tokio_stream::wrappers::ReceiverStream::new(batch_receiver)
             .then(|batch| {
+                let mut cache = self.cache.clone();
                 async move {
                     let Batch {
                         peer,
@@ -250,8 +333,19 @@ where
                     } = batch;
 
                     let mut done = vec![];
+                    let mut shutdown = shutdown.clone();
                     for sealed_block in results {
-                        let res = execute_and_commit(executor.as_ref(), state, sealed_block).await;
+                        let height = *sealed_block.entity.header().height();
+                        let res = tokio::select! {
+                            biased;
+                            _ = shutdown.while_started() => {
+                                break;
+                            },
+                            res = execute_and_commit(executor.as_ref(), state, sealed_block) => {
+                                cache.remove_element(&height);
+                                res
+                            },
+                        };
 
                         match &res {
                             Ok(_) => {
@@ -266,7 +360,7 @@ where
                         };
                     }
 
-                    let batch = Batch::new(peer.clone(), range, done);
+                    let batch = Batch::new(peer.clone(), range.clone(), done);
 
                     if !batch.is_err() {
                         report_peer(p2p, peer, PeerReportReason::SuccessfulBlockImport);
@@ -283,12 +377,14 @@ where
             // Count the number of successfully executed blocks.
             // Fold the stream into a count.
             .fold(0usize, |count, batch| async move {
-                count + batch.results.len()
+                count.checked_add(batch.results.len()).expect("It is impossible to fetch so much data to overflow `usize`")
             })
             .await;
 
-        // Wait for any spawned tasks to shutdown
-        let _ = shutdown_guard_recv.recv().await;
+        // Wait for spawned task to finish
+        let _ = fetch_batches_task
+            .await
+            .trace_err("Failed to join the fetch batches task");
         result
     }
 }
@@ -298,82 +394,112 @@ fn get_block_stream<
     C: ConsensusPort + Send + Sync + 'static,
 >(
     range: RangeInclusive<u32>,
-    params: &Config,
+    header_batch_size: NonZeroU32,
     p2p: Arc<P>,
     consensus: Arc<C>,
-) -> impl Stream<Item = impl Future<Output = SealedBlockBatch>> + '_ {
-    let header_stream = get_header_batch_stream(range.clone(), params, p2p.clone());
-    header_stream
+    cache: Cache,
+) -> impl Stream<Item = impl Future<Output = SealedBlockBatch>> {
+    cache
+        .get_chunks(range.clone(), header_batch_size)
         .map({
-            let consensus = consensus.clone();
             let p2p = p2p.clone();
-            move |header_batch: SealedHeaderBatch| {
-                let Batch {
-                    peer,
-                    range,
-                    results,
-                } = header_batch;
-                let checked_headers = results
-                    .into_iter()
-                    .take_while(|header| {
-                        check_sealed_header(header, peer.clone(), &p2p, &consensus)
-                    })
-                    .collect::<Vec<_>>();
-                Batch::new(peer, range, checked_headers)
-            }
-        })
-        .map(move |headers| {
-            let consensus = consensus.clone();
-            let p2p = p2p.clone();
-            async move {
-                let Batch {
-                    peer,
-                    range,
-                    results,
-                } = headers;
-                if results.is_empty() {
-                    SealedBlockBatch::new(peer, range, vec![])
-                } else {
-                    await_da_height(
-                        results
-                            .last()
-                            .expect("We checked headers are not empty above"),
-                        &consensus,
-                    )
-                    .await;
-                    let headers = SealedHeaderBatch::new(peer, range, results);
-                    get_blocks(&p2p, headers).await
+            move |cached_data_batch| {
+                let p2p = p2p.clone();
+                async move {
+                    if let CachedDataBatch::None(range) = cached_data_batch {
+                        BlockHeaderData::Fetched(get_headers_batch(range, &p2p).await)
+                    } else {
+                        BlockHeaderData::Cached(cached_data_batch)
+                    }
                 }
             }
-            .instrument(tracing::debug_span!("consensus_and_transactions"))
-            .in_current_span()
         })
-}
-
-fn get_header_batch_stream<P: PeerToPeerPort + Send + Sync + 'static>(
-    range: RangeInclusive<u32>,
-    params: &Config,
-    p2p: Arc<P>,
-) -> impl Stream<Item = SealedHeaderBatch> {
-    let Config {
-        header_batch_size, ..
-    } = params;
-    let ranges = range_chunks(range, *header_batch_size);
-    futures::stream::iter(ranges).then(move |range| {
-        let p2p = p2p.clone();
-        async move { get_headers_batch(range, &p2p).await }
-    })
-}
-
-fn range_chunks(
-    range: RangeInclusive<u32>,
-    chunk_size: u32,
-) -> impl Iterator<Item = Range<u32>> {
-    let end = *range.end() + 1;
-    range.step_by(chunk_size as usize).map(move |chunk_start| {
-        let block_end = (chunk_start + chunk_size).min(end);
-        chunk_start..block_end
-    })
+        .map({
+            let p2p = p2p.clone();
+            let consensus = consensus.clone();
+            let cache = cache.clone();
+            move |header_batch| {
+                let p2p = p2p.clone();
+                let consensus = consensus.clone();
+                let mut cache = cache.clone();
+                async move {
+                    match header_batch.await {
+                        BlockHeaderData::Cached(cached_data) => {
+                            BlockHeaderData::Cached(cached_data)
+                        }
+                        BlockHeaderData::Fetched(fetched_batch) => {
+                            let Batch {
+                                peer,
+                                range,
+                                results,
+                            } = fetched_batch;
+                            let checked_headers = results
+                                .into_iter()
+                                .take_while(|header| {
+                                    check_sealed_header(
+                                        header,
+                                        peer.clone(),
+                                        &p2p,
+                                        &consensus,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            let batch = Batch::new(peer, range.clone(), checked_headers);
+                            if !batch.is_err() {
+                                cache.insert_headers(batch.clone());
+                            }
+                            BlockHeaderData::Fetched(batch)
+                        }
+                    }
+                }
+            }
+        })
+        .map({
+            let p2p = p2p.clone();
+            let consensus = consensus.clone();
+            move |headers| {
+                let p2p = p2p.clone();
+                let consensus = consensus.clone();
+                let mut cache = cache.clone();
+                async move {
+                    match headers.await {
+                        BlockHeaderData::Cached(CachedDataBatch::Blocks(batch)) => batch,
+                        BlockHeaderData::Cached(CachedDataBatch::Headers(batch))
+                        | BlockHeaderData::Fetched(batch) => {
+                            let Batch {
+                                peer,
+                                range,
+                                results,
+                            } = batch;
+                            if results.is_empty() {
+                                SealedBlockBatch::new(peer, range, vec![])
+                            } else {
+                                await_da_height(
+                                    results
+                                        .last()
+                                        .expect("We checked headers are not empty above"),
+                                    &consensus,
+                                )
+                                .await;
+                                let headers =
+                                    SealedHeaderBatch::new(peer, range.clone(), results);
+                                let batch = get_blocks(&p2p, headers).await;
+                                if !batch.is_err() {
+                                    cache.insert_blocks(batch.clone());
+                                }
+                                batch
+                            }
+                        }
+                        BlockHeaderData::Cached(CachedDataBatch::None(_)) => {
+                            tracing::error!("Cached data batch should never be created outside of the caching algorithm.");
+                            Batch::new(None, 0..1, vec![])
+                        }
+                    }
+                }
+                .instrument(tracing::debug_span!("consensus_and_transactions"))
+                .in_current_span()
+            }
+        })
 }
 
 fn check_sealed_header<
@@ -381,7 +507,7 @@ fn check_sealed_header<
     C: ConsensusPort + Send + Sync + 'static,
 >(
     header: &SealedBlockHeader,
-    peer_id: PeerId,
+    peer_id: Option<PeerId>,
     p2p: &Arc<P>,
     consensus: &Arc<C>,
 ) -> bool {
@@ -426,7 +552,7 @@ async fn wait_for_notify_or_shutdown(
 async fn get_sealed_block_headers<P>(
     range: Range<u32>,
     p2p: &Arc<P>,
-) -> SourcePeer<Vec<SealedBlockHeader>>
+) -> Option<SourcePeer<Vec<SealedBlockHeader>>>
 where
     P: PeerToPeerPort + Send + Sync + 'static,
 {
@@ -438,28 +564,52 @@ where
     p2p.get_sealed_block_headers(range)
         .await
         .trace_err("Failed to get headers")
-        .unwrap_or_default()
-        .map(|inner| inner.unwrap_or_default())
+        .ok()
+        .map(|res| res.map(|data| data.unwrap_or_default()))
 }
 
 async fn get_transactions<P>(
-    peer_id: PeerId,
     range: Range<u32>,
+    peer_id: Option<PeerId>,
     p2p: &Arc<P>,
-) -> Option<Vec<Transactions>>
+) -> Option<SourcePeer<Vec<Transactions>>>
 where
     P: PeerToPeerPort + Send + Sync + 'static,
 {
-    let range = peer_id.clone().bind(range);
-    let res = p2p
-        .get_transactions(range)
-        .await
-        .trace_err("Failed to get transactions");
-    match res {
-        Ok(Some(transactions)) => Some(transactions),
-        _ => {
-            report_peer(p2p, peer_id.clone(), PeerReportReason::MissingTransactions);
-            None
+    match peer_id {
+        Some(peer_id) => {
+            let source_peer = peer_id.clone().bind(range.clone());
+            let Ok(Some(txs)) = p2p
+                .get_transactions_from_peer(source_peer)
+                .await
+                .trace_err("Failed to get transactions")
+            else {
+                report_peer(
+                    p2p,
+                    Some(peer_id.clone()),
+                    PeerReportReason::MissingTransactions,
+                );
+                return None;
+            };
+            Some(SourcePeer { peer_id, data: txs })
+        }
+        None => {
+            let Ok(SourcePeer { peer_id, data }) = p2p
+                .get_transactions(range.clone())
+                .await
+                .trace_err("Failed to get transactions")
+            else {
+                return None;
+            };
+            let Some(txs) = data else {
+                report_peer(
+                    p2p,
+                    Some(peer_id.clone()),
+                    PeerReportReason::MissingTransactions,
+                );
+                return None;
+            };
+            Some(SourcePeer { peer_id, data: txs })
         }
     }
 }
@@ -473,7 +623,9 @@ where
         range.start,
         range.end
     );
-    let sourced_headers = get_sealed_block_headers(range.clone(), p2p).await;
+    let Some(sourced_headers) = get_sealed_block_headers(range.clone(), p2p).await else {
+        return Batch::new(None, range, vec![])
+    };
     let SourcePeer {
         peer_id,
         data: headers,
@@ -489,21 +641,27 @@ where
         .map(|(header, _)| header)
         .collect::<Vec<_>>();
     if headers.len() != range.len() {
-        report_peer(p2p, peer_id.clone(), PeerReportReason::MissingBlockHeaders);
+        report_peer(
+            p2p,
+            Some(peer_id.clone()),
+            PeerReportReason::MissingBlockHeaders,
+        );
     }
-    Batch::new(peer_id, range, headers)
+    Batch::new(Some(peer_id), range, headers)
 }
 
-fn report_peer<P>(p2p: &Arc<P>, peer_id: PeerId, reason: PeerReportReason)
+fn report_peer<P>(p2p: &Arc<P>, peer_id: Option<PeerId>, reason: PeerReportReason)
 where
     P: PeerToPeerPort + Send + Sync + 'static,
 {
-    tracing::info!("Reporting peer for {:?}", reason);
+    if let Some(peer_id) = peer_id {
+        tracing::info!("Reporting peer for {:?}", reason);
 
-    // Failure to report a peer is a non-fatal error; ignore the error
-    let _ = p2p
-        .report_peer(peer_id.clone(), reason)
-        .trace_err(&format!("Failed to report peer {:?}", peer_id));
+        // Failure to report a peer is a non-fatal error; ignore the error
+        let _ = p2p
+            .report_peer(peer_id.clone(), reason)
+            .trace_err(&format!("Failed to report peer {:?}", peer_id));
+    }
 }
 
 /// Get blocks correlating to the headers from a specific peer
@@ -514,15 +672,19 @@ where
 {
     let Batch {
         results: headers,
-        peer,
         range,
+        peer,
     } = headers;
-    let Some(transaction_data) = get_transactions(peer.clone(), range.clone(), p2p).await
+
+    let Some(SourcePeer {
+        peer_id,
+        data: transactions,
+    }) = get_transactions(range.clone(), peer.clone(), p2p).await
     else {
         return Batch::new(peer, range, vec![])
     };
 
-    let iter = headers.into_iter().zip(transaction_data.into_iter());
+    let iter = headers.into_iter().zip(transactions.into_iter());
     let mut blocks = vec![];
     for (block_header, transactions) in iter {
         let SealedBlockHeader {
@@ -537,18 +699,22 @@ where
         if let Some(block) = block {
             blocks.push(block);
         } else {
-            report_peer(p2p, peer.clone(), PeerReportReason::InvalidTransactions);
+            report_peer(
+                p2p,
+                Some(peer_id.clone()),
+                PeerReportReason::InvalidTransactions,
+            );
             break
         }
     }
-    Batch::new(peer, range, blocks)
+    Batch::new(Some(peer_id), range, blocks)
 }
 
 #[tracing::instrument(
     skip_all,
     fields(
         height = **block.entity.header().height(),
-        id = %block.entity.header().consensus.generated.application_hash
+        id = %block.entity.header().consensus().generated.application_hash
     ),
     err
 )]
@@ -565,10 +731,10 @@ where
     let r = executor.execute_and_commit(block).await;
 
     // If the block executed successfully, mark it as committed.
-    if r.is_ok() {
-        state.apply(|s| s.commit(*height));
+    if let Err(err) = &r {
+        tracing::error!("Execution of height {} failed: {:?}", *height, err);
     } else {
-        tracing::error!("Execution of height {} failed: {:?}", *height, r);
+        state.apply(|s| s.commit(*height));
     }
     r
 }
@@ -597,9 +763,9 @@ impl<S> ScanNone<S> {
         S: Stream<Item = Option<T>> + Send + 'a,
     {
         let stream = self.0.boxed::<'a>();
-        futures::stream::unfold((false, stream), |(_, mut stream)| async move {
-            let element = stream.next().await?;
-            element.map(|e| (e, (false, stream)))
+        futures::stream::unfold(stream, |mut stream| async move {
+            let element = stream.next().await??;
+            Some((element, stream))
         })
     }
 }

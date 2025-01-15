@@ -20,7 +20,7 @@ use crate::client::{
     },
 };
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct Message {
     pub amount: U64,
@@ -31,13 +31,29 @@ pub struct Message {
     pub da_height: U64,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryVariables, Debug)]
+pub struct NonceArgs {
+    pub nonce: Nonce,
+}
+
+#[derive(cynic::QueryFragment, Clone, Debug)]
+#[cynic(
+    schema_path = "./assets/schema.sdl",
+    graphql_type = "Query",
+    variables = "NonceArgs"
+)]
+pub struct MessageQuery {
+    #[arguments(nonce: $nonce)]
+    pub message: Option<Message>,
+}
+
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct MessageStatus {
     pub(crate) state: MessageState,
 }
 
-#[derive(cynic::Enum, Debug)]
+#[derive(cynic::Enum, Clone, Copy, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub enum MessageState {
     Unspent,
@@ -45,7 +61,7 @@ pub enum MessageState {
     NotFound,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(
     schema_path = "./assets/schema.sdl",
     graphql_type = "Query",
@@ -56,14 +72,14 @@ pub struct OwnedMessageQuery {
     pub messages: MessageConnection,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct MessageConnection {
     pub edges: Vec<MessageEdge>,
     pub page_info: PageInfo,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct MessageEdge {
     pub cursor: String,
@@ -85,7 +101,7 @@ pub struct OwnedMessagesConnectionArgs {
     pub last: Option<i32>,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(
     schema_path = "./assets/schema.sdl",
     graphql_type = "Query",
@@ -98,10 +114,10 @@ pub struct MessageProofQuery {
         commitBlockId: $commit_block_id,
         commitBlockHeight: $commit_block_height
     )]
-    pub message_proof: Option<MessageProof>,
+    pub message_proof: MessageProof,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct MerkleProof {
     /// The proof set of the message proof.
@@ -110,7 +126,7 @@ pub struct MerkleProof {
     pub proof_index: U64,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct MessageProof {
     /// Proof that message is contained within the provided block header.
@@ -153,7 +169,7 @@ pub struct MessageProofArgs {
     pub commit_block_height: Option<U32>,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(
     schema_path = "./assets/schema.sdl",
     graphql_type = "Query",
@@ -177,7 +193,7 @@ impl From<(Option<Address>, PaginationRequest<String>)> for OwnedMessagesConnect
                 owner: r.0,
                 after: r.1.cursor,
                 before: None,
-                first: Some(r.1.results as i32),
+                first: Some(r.1.results),
                 last: None,
             },
             PageDirection::Backward => OwnedMessagesConnectionArgs {
@@ -185,7 +201,7 @@ impl From<(Option<Address>, PaginationRequest<String>)> for OwnedMessagesConnect
                 after: None,
                 before: r.1.cursor,
                 first: None,
-                last: Some(r.1.results as i32),
+                last: Some(r.1.results),
             },
         }
     }

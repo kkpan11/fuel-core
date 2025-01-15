@@ -1,31 +1,19 @@
-use crate::state::{
-    State,
-    StateWatcher,
+use crate::{
+    state::{
+        State,
+        StateWatcher,
+    },
+    Shared,
 };
 use anyhow::anyhow;
-use fuel_core_metrics::{
+use fuel_core_metrics::futures::{
     future_tracker::FutureTracker,
-    services::{
-        services_metrics,
-        ServiceLifecycle,
-    },
+    FuturesMetrics,
 };
 use futures::FutureExt;
+use std::any::Any;
 use tokio::sync::watch;
 use tracing::Instrument;
-
-/// Alias for Arc<T>
-pub type Shared<T> = std::sync::Arc<T>;
-
-/// A mutex that can safely be in async contexts and avoids deadlocks.
-#[derive(Debug)]
-pub struct SharedMutex<T>(Shared<parking_lot::Mutex<T>>);
-
-impl<T> Clone for SharedMutex<T> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
 
 /// Used if services have no asynchronously shared data
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +83,44 @@ pub trait RunnableService: Send {
     ) -> anyhow::Result<Self::Task>;
 }
 
+/// The result of a single iteration of the service task
+#[derive(Debug)]
+pub enum TaskNextAction {
+    /// Request the task to be run again
+    Continue,
+    /// Request the task to be abandoned
+    Stop,
+    /// Request the task to be run again, but report an error
+    ErrorContinue(anyhow::Error),
+}
+
+impl TaskNextAction {
+    /// Creates a `TaskRunResult` from a `Result` where `Ok` means `Continue` and any error is reported
+    pub fn always_continue<T, E: Into<anyhow::Error>>(
+        res: Result<T, E>,
+    ) -> TaskNextAction {
+        match res {
+            Ok(_) => TaskNextAction::Continue,
+            Err(e) => TaskNextAction::ErrorContinue(e.into()),
+        }
+    }
+}
+
+impl From<Result<bool, anyhow::Error>> for TaskNextAction {
+    fn from(result: Result<bool, anyhow::Error>) -> Self {
+        match result {
+            Ok(should_continue) => {
+                if should_continue {
+                    TaskNextAction::Continue
+                } else {
+                    TaskNextAction::Stop
+                }
+            }
+            Err(e) => TaskNextAction::ErrorContinue(e),
+        }
+    }
+}
+
 /// The trait is implemented by the service task and contains a single iteration of the infinity
 /// loop.
 #[async_trait::async_trait]
@@ -108,7 +134,7 @@ pub trait RunnableTask: Send {
     /// `State::Started`. So first, the `run` method should return a value, and after, the service
     /// will stop. If the service should react to the state change earlier, it should handle it in
     /// the `run` loop on its own. See [`StateWatcher::while_started`].
-    async fn run(&mut self, watcher: &mut StateWatcher) -> anyhow::Result<bool>;
+    async fn run(&mut self, watcher: &mut StateWatcher) -> TaskNextAction;
 
     /// Gracefully shutdowns the task after the end of the execution cycle.
     async fn shutdown(self) -> anyhow::Result<()>;
@@ -153,7 +179,7 @@ where
     /// Initializes a new `ServiceRunner` containing a `RunnableService` with parameters for underlying `Task`
     pub fn new_with_params(service: S, params: S::TaskParams) -> Self {
         let shared = service.shared_data();
-        let metric = services_metrics().register_service(S::NAME);
+        let metric = FuturesMetrics::obtain_futures_metrics(S::NAME);
         let state = initialize_loop(service, params, metric);
         Self { shared, state }
     }
@@ -165,7 +191,7 @@ where
         loop {
             let state = start.borrow().clone();
             if !state.starting() {
-                return Ok(state)
+                return Ok(state);
             }
             start.changed().await?;
         }
@@ -175,7 +201,7 @@ where
         loop {
             let state = stop.borrow().clone();
             if state.stopped() {
-                return Ok(state)
+                return Ok(state);
             }
             stop.changed().await?;
         }
@@ -254,7 +280,7 @@ where
 fn initialize_loop<S>(
     service: S,
     params: S::TaskParams,
-    metric: ServiceLifecycle,
+    metric: FuturesMetrics,
 ) -> Shared<watch::Sender<State>>
 where
     S: RunnableService + 'static,
@@ -295,6 +321,8 @@ where
                 }
             });
 
+            tracing::info!("The service {} is shut down", S::NAME);
+
             if let State::StoppedWithError(err) = stopped_state {
                 std::panic::resume_unwind(Box::new(err));
             }
@@ -309,7 +337,7 @@ async fn run<S>(
     service: S,
     sender: Shared<watch::Sender<State>>,
     params: S::TaskParams,
-    metric: ServiceLifecycle,
+    metric: FuturesMetrics,
 ) where
     S: RunnableService + 'static,
 {
@@ -321,14 +349,15 @@ async fn run<S>(
 
     // If the state after update is not `Starting` then return to stop the service.
     if !state.borrow().starting() {
-        return
+        return;
     }
 
     // We can panic here, because it is inside of the task.
+    tracing::info!("Starting {} service", S::NAME);
     let mut task = service
         .into_task(&state, params)
         .await
-        .expect("The initialization of the service failed.");
+        .expect("The initialization of the service failed");
 
     sender.send_if_modified(|s| {
         if s.starting() {
@@ -339,6 +368,20 @@ async fn run<S>(
         }
     });
 
+    let got_panic = run_task(&mut task, state, &metric).await;
+
+    let got_panic = shutdown_task(S::NAME, task, got_panic).await;
+
+    if let Some(panic) = got_panic {
+        std::panic::resume_unwind(panic)
+    }
+}
+
+async fn run_task<S: RunnableTask>(
+    task: &mut S,
+    mut state: StateWatcher,
+    metric: &FuturesMetrics,
+) -> Option<Box<dyn Any + Send>> {
     let mut got_panic = None;
 
     while state.borrow_and_update().started() {
@@ -349,37 +392,43 @@ async fn run<S>(
         if let Err(panic) = panic_result {
             tracing::debug!("got a panic");
             got_panic = Some(panic);
-            break
+            break;
         }
 
         let tracked_result = panic_result.expect("Checked the panic above");
-
-        // TODO: Use `u128` when `AtomicU128` is stable.
-        metric.busy.inc_by(tracked_result.busy.as_nanos() as u64);
-        metric.idle.inc_by(tracked_result.idle.as_nanos() as u64);
-
-        let result = tracked_result.output;
+        let result = tracked_result.extract(metric);
 
         match result {
-            Ok(should_continue) => {
-                if !should_continue {
-                    tracing::debug!("stopping");
-                    break
-                }
+            TaskNextAction::Continue => {
                 tracing::debug!("run loop");
             }
-            Err(e) => {
+            TaskNextAction::Stop => {
+                tracing::debug!("stopping");
+                break;
+            }
+            TaskNextAction::ErrorContinue(e) => {
                 let e: &dyn std::error::Error = &*e;
                 tracing::error!(e);
             }
         }
     }
+    got_panic
+}
 
+async fn shutdown_task<S>(
+    name: &str,
+    task: S,
+    mut got_panic: Option<Box<dyn Any + Send>>,
+) -> Option<Box<dyn Any + Send>>
+where
+    S: RunnableTask,
+{
+    tracing::info!("Shutting down {} service", name);
     let shutdown = std::panic::AssertUnwindSafe(task.shutdown());
     match shutdown.catch_unwind().await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            tracing::error!("Go an error during shutdown of the task: {e}");
+            tracing::error!("Got an error during shutdown of the task: {e}");
         }
         Err(e) => {
             if got_panic.is_some() {
@@ -393,29 +442,7 @@ async fn run<S>(
             }
         }
     }
-
-    if let Some(panic) = got_panic {
-        std::panic::resume_unwind(panic)
-    }
-}
-
-impl<T> SharedMutex<T> {
-    /// Creates a new `SharedMutex` with the given value.
-    pub fn new(t: T) -> Self {
-        Self(Shared::new(parking_lot::Mutex::new(t)))
-    }
-
-    /// Apply a function to the inner value and return a value.
-    pub fn apply<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        let mut t = self.0.lock();
-        f(&mut t)
-    }
-}
-
-impl<T> From<T> for SharedMutex<T> {
-    fn from(t: T) -> Self {
-        Self::new(t)
-    }
+    got_panic
 }
 
 fn panic_to_string(e: Box<dyn core::any::Any + Send>) -> String {
@@ -458,7 +485,7 @@ mod tests {
             fn run<'_self, '_state, 'a>(
                 &'_self mut self,
                 state: &'_state mut StateWatcher
-            ) -> BoxFuture<'a, anyhow::Result<bool>>
+            ) -> BoxFuture<'a, TaskNextAction>
             where
                 '_self: 'a,
                 '_state: 'a,
@@ -478,8 +505,7 @@ mod tests {
                     let mut watcher = watcher.clone();
                     Box::pin(async move {
                         watcher.while_started().await.unwrap();
-                        let should_continue = false;
-                        Ok(should_continue)
+                        TaskNextAction::Stop
                     })
                 });
                 mock.expect_shutdown().times(1).returning(|| Ok(()));
@@ -543,12 +569,8 @@ mod tests {
         mock.expect_shared_data().returning(|| EmptyShared);
         mock.expect_into_task().returning(|_, _| {
             let mut mock = MockTask::default();
-            mock.expect_run().returning(|_| {
-                Box::pin(async move {
-                    let should_continue = false;
-                    Ok(should_continue)
-                })
-            });
+            mock.expect_run()
+                .returning(|_| Box::pin(async move { TaskNextAction::Stop }));
             mock.expect_shutdown()
                 .times(1)
                 .returning(|| panic!("Shutdown should fail"));

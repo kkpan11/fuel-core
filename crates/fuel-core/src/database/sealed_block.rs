@@ -1,9 +1,9 @@
-use crate::database::{
-    storage::DatabaseColumn,
-    Column,
-    Database,
-};
+use crate::database::OnChainIterableKeyValueView;
 use fuel_core_storage::{
+    iter::{
+        IterDirection,
+        IteratorOverTable,
+    },
     not_found,
     tables::{
         FuelBlocks,
@@ -14,12 +14,11 @@ use fuel_core_storage::{
 };
 use fuel_core_types::{
     blockchain::{
+        block::CompressedBlock,
         consensus::{
             Consensus,
             Genesis,
-            Sealed,
         },
-        primitives::BlockId,
         SealedBlock,
         SealedBlockHeader,
     },
@@ -28,23 +27,19 @@ use fuel_core_types::{
 };
 use std::ops::Range;
 
-impl DatabaseColumn for SealedBlockConsensus {
-    fn column() -> Column {
-        Column::FuelBlockConsensus
-    }
-}
-
-impl Database {
-    pub fn get_sealed_block_by_id(
+impl OnChainIterableKeyValueView {
+    /// Returns `SealedBlock` by `height`.
+    /// Reusable across different trait implementations
+    pub fn get_sealed_block_by_height(
         &self,
-        block_id: &BlockId,
+        height: &BlockHeight,
     ) -> StorageResult<Option<SealedBlock>> {
         // combine the block and consensus metadata into a sealed fuel block type
+        let consensus = self.storage::<SealedBlockConsensus>().get(height)?;
 
-        let block = self.get_full_block(block_id)?;
-        let consensus = self.storage::<SealedBlockConsensus>().get(block_id)?;
+        if let Some(consensus) = consensus {
+            let block = self.get_full_block(height)?.ok_or(not_found!(FuelBlocks))?;
 
-        if let (Some(block), Some(consensus)) = (block, consensus) {
             let sealed_block = SealedBlock {
                 entity: block,
                 consensus: consensus.into_owned(),
@@ -56,66 +51,56 @@ impl Database {
         }
     }
 
-    /// Returns `SealedBlock` by `height`.
-    /// Reusable across different trait implementations
-    pub fn get_sealed_block_by_height(
-        &self,
-        height: &BlockHeight,
-    ) -> StorageResult<Option<SealedBlock>> {
-        let block_id = match self.get_block_id(height)? {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-        self.get_sealed_block_by_id(&block_id)
+    pub fn genesis_height(&self) -> StorageResult<Option<BlockHeight>> {
+        self.iter_all_keys::<FuelBlocks>(Some(IterDirection::Forward))
+            .next()
+            .transpose()
+    }
+
+    pub fn genesis_block(&self) -> StorageResult<Option<CompressedBlock>> {
+        Ok(self
+            .iter_all::<FuelBlocks>(Some(IterDirection::Forward))
+            .next()
+            .transpose()?
+            .map(|(_, block)| block))
     }
 
     pub fn get_genesis(&self) -> StorageResult<Genesis> {
-        let (_, genesis_block_id) = self.ids_of_genesis_block()?;
-        let consensus = self
-            .storage::<SealedBlockConsensus>()
-            .get(&genesis_block_id)?
-            .map(|c| c.into_owned());
+        let pair = self
+            .iter_all::<SealedBlockConsensus>(Some(IterDirection::Forward))
+            .next()
+            .transpose()?;
 
-        if let Some(Consensus::Genesis(genesis)) = consensus {
+        if let Some((_, Consensus::Genesis(genesis))) = pair {
             Ok(genesis)
         } else {
             Err(not_found!(SealedBlockConsensus))
         }
     }
 
-    pub fn get_sealed_block_header_by_height(
-        &self,
-        height: &BlockHeight,
-    ) -> StorageResult<Option<SealedBlockHeader>> {
-        let block_id = match self.get_block_id(height)? {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-        self.get_sealed_block_header(&block_id)
-    }
-
     pub fn get_sealed_block_headers(
         &self,
         block_height_range: Range<u32>,
-    ) -> StorageResult<Vec<SealedBlockHeader>> {
+    ) -> StorageResult<Option<Vec<SealedBlockHeader>>> {
         let headers = block_height_range
             .map(BlockHeight::from)
-            .map(|height| self.get_sealed_block_header_by_height(&height))
-            .collect::<StorageResult<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+            .map(|height| self.get_sealed_block_header(&height))
+            .collect::<StorageResult<Option<Vec<_>>>>()?;
         Ok(headers)
     }
 
     pub fn get_sealed_block_header(
         &self,
-        block_id: &BlockId,
+        height: &BlockHeight,
     ) -> StorageResult<Option<SealedBlockHeader>> {
-        let header = self.storage::<FuelBlocks>().get(block_id)?;
-        let consensus = self.storage::<SealedBlockConsensus>().get(block_id)?;
+        let consensus = self.storage::<SealedBlockConsensus>().get(height)?;
 
-        if let (Some(header), Some(consensus)) = (header, consensus) {
+        if let Some(consensus) = consensus {
+            let header = self
+                .storage::<FuelBlocks>()
+                .get(height)?
+                .ok_or(not_found!(FuelBlocks))?; // This shouldn't happen if a block has been sealed
+
             let sealed_block = SealedBlockHeader {
                 entity: header.into_owned().header().clone(),
                 consensus: consensus.into_owned(),
@@ -136,8 +121,8 @@ impl Database {
             .map(BlockHeight::from)
             .map(|block_height| {
                 let transactions = self
-                    .get_sealed_block_by_height(&block_height)?
-                    .map(|Sealed { entity: block, .. }| block.into_inner().1)
+                    .get_full_block(&block_height)?
+                    .map(|block| block.into_inner().1)
                     .map(Transactions);
                 Ok(transactions)
             })

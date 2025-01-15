@@ -15,7 +15,7 @@ use std::{
 };
 
 pub const CONFIG_FILE_KEY: &str = "FUEL_CORE_E2E_CONFIG";
-pub const SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SYNC_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub mod config;
 pub mod test_context;
@@ -53,6 +53,15 @@ pub fn main_body(config: SuiteConfig, mut args: Arguments) {
             }),
         ),
         Trial::test(
+            "can collect fee from alice",
+            with_cloned(&config, |config| {
+                async_execute(async {
+                    let ctx = TestContext::new(config).await;
+                    tests::collect_fee::collect_fee(&ctx).await
+                })
+            }),
+        ),
+        Trial::test(
             "can execute script and get receipts",
             with_cloned(&config, |config| {
                 async_execute(async {
@@ -72,6 +81,16 @@ pub fn main_body(config: SuiteConfig, mut args: Arguments) {
             }),
         ),
         Trial::test(
+            "can dry run multiple transfer scripts and get receipts",
+            with_cloned(&config, |config| {
+                async_execute(async {
+                    let ctx = TestContext::new(config).await;
+                    tests::script::dry_run_multiple_txs(&ctx).await
+                })?;
+                Ok(())
+            }),
+        ),
+        Trial::test(
             "dry run script that touches the contract with large state",
             with_cloned(&config, |config| {
                 async_execute(async {
@@ -82,11 +101,11 @@ pub fn main_body(config: SuiteConfig, mut args: Arguments) {
             }),
         ),
         Trial::test(
-            "dry run transaction from `non_specific_tx.raw` file",
+            "dry run transaction from `arbitrary_tx.raw` file",
             with_cloned(&config, |config| {
                 async_execute(async {
                     let ctx = TestContext::new(config).await;
-                    tests::script::non_specific_transaction(&ctx).await
+                    tests::script::arbitrary_transaction(&ctx).await
                 })?;
                 Ok(())
             }),
@@ -96,7 +115,7 @@ pub fn main_body(config: SuiteConfig, mut args: Arguments) {
             with_cloned(&config, |config| {
                 async_execute(async {
                     let ctx = TestContext::new(config).await;
-                    tests::transfers::transfer_back(&ctx).await
+                    tests::contracts::deploy_large_contract(&ctx).await
                 })
             }),
         ),

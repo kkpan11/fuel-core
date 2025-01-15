@@ -1,26 +1,30 @@
 //! Higher level domain types
 
+use crate::entities::relayer::message::MessageV1;
 use coins::message_coin::MessageCoin;
-use message::Message;
+pub use relayer::{
+    message::Message,
+    transaction::RelayedTransaction,
+};
+
+#[cfg(feature = "alloc")]
+use alloc::vec;
 
 pub mod coins;
 pub mod contract;
-pub mod message;
+pub mod relayer;
 
 impl TryFrom<Message> for MessageCoin {
     type Error = anyhow::Error;
 
     fn try_from(message: Message) -> Result<Self, Self::Error> {
-        let Message {
-            sender,
-            recipient,
-            nonce,
-            amount,
-            data,
-            da_height,
-        } = message;
+        let sender = *message.sender();
+        let recipient = *message.recipient();
+        let nonce = *message.nonce();
+        let amount = message.amount();
+        let da_height = message.da_height();
 
-        if !data.is_empty() {
+        if message.is_retryable_message() {
             return Err(anyhow::anyhow!(
                 "The data is not empty, impossible to convert into the `MessageCoin`"
             ))
@@ -48,7 +52,7 @@ impl From<MessageCoin> for Message {
             da_height,
         } = coin;
 
-        Message {
+        MessageV1 {
             sender,
             recipient,
             nonce,
@@ -56,5 +60,6 @@ impl From<MessageCoin> for Message {
             data: vec![],
             da_height,
         }
+        .into()
     }
 }

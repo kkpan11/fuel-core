@@ -16,7 +16,7 @@ pub struct BalanceArgs {
     pub asset_id: AssetId,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(
     schema_path = "./assets/schema.sdl",
     graphql_type = "Query",
@@ -56,7 +56,7 @@ impl From<(Address, PaginationRequest<String>)> for BalancesConnectionArgs {
                 filter: BalanceFilterInput { owner: r.0 },
                 after: r.1.cursor,
                 before: None,
-                first: Some(r.1.results as i32),
+                first: Some(r.1.results),
                 last: None,
             },
             PageDirection::Backward => BalancesConnectionArgs {
@@ -64,13 +64,13 @@ impl From<(Address, PaginationRequest<String>)> for BalancesConnectionArgs {
                 after: None,
                 before: r.1.cursor,
                 first: None,
-                last: Some(r.1.results as i32),
+                last: Some(r.1.results),
             },
         }
     }
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(
     schema_path = "./assets/schema.sdl",
     graphql_type = "Query",
@@ -81,21 +81,21 @@ pub struct BalancesQuery {
     pub balances: BalanceConnection,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct BalanceConnection {
     pub edges: Vec<BalanceEdge>,
     pub page_info: PageInfo,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct BalanceEdge {
     pub cursor: String,
     pub node: Balance,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct Balance {
     pub owner: Address,

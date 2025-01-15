@@ -1,29 +1,26 @@
 use super::scalars::{
     Bytes32,
     Tai64Timestamp,
+    TransactionId,
 };
 use crate::{
     fuel_core_graphql_api::{
-        service::{
-            ConsensusModule,
-            Database,
-        },
+        api_service::ConsensusModule,
+        database::ReadView,
+        query_costs,
         Config as GraphQLConfig,
-    },
-    graphql_api::IntoApiResult,
-    query::{
-        BlockQueryData,
-        SimpleBlockData,
-        SimpleTransactionData,
+        IntoApiResult,
     },
     schema::{
         scalars::{
             BlockId,
             Signature,
+            U16,
             U32,
             U64,
         },
         tx::types::Transaction,
+        ReadViewProvider,
     },
 };
 use anyhow::anyhow;
@@ -33,16 +30,13 @@ use async_graphql::{
         EmptyFields,
     },
     Context,
+    Enum,
     Object,
     SimpleObject,
     Union,
 };
 use fuel_core_storage::{
-    iter::{
-        BoxedIter,
-        IntoBoxedIter,
-        IterDirection,
-    },
+    iter::IterDirection,
     Result as StorageResult,
 };
 use fuel_core_types::{
@@ -50,8 +44,16 @@ use fuel_core_types::{
         block::CompressedBlock,
         header::BlockHeader,
     },
-    fuel_types,
-    fuel_types::BlockHeight,
+    fuel_tx::TxId,
+    fuel_types::{
+        self,
+        BlockHeight,
+    },
+};
+use futures::{
+    Stream,
+    StreamExt,
+    TryStreamExt,
 };
 
 pub struct Block(pub(crate) CompressedBlock);
@@ -59,6 +61,7 @@ pub struct Block(pub(crate) CompressedBlock);
 pub struct Header(pub(crate) BlockHeader);
 
 #[derive(Union)]
+#[non_exhaustive]
 pub enum Consensus {
     Genesis(Genesis),
     PoA(PoAConsensus),
@@ -78,49 +81,102 @@ pub struct Genesis {
     pub contracts_root: Bytes32,
     /// The Binary Merkle Tree root of all genesis messages.
     pub messages_root: Bytes32,
+    /// The Binary Merkle Tree root of all processed transaction ids.
+    pub transactions_root: Bytes32,
 }
 
 pub struct PoAConsensus {
     signature: Signature,
 }
 
+#[derive(Clone, Copy, Debug, Enum, Eq, PartialEq)]
+pub enum BlockVersion {
+    V1,
+}
+
 #[Object]
 impl Block {
+    async fn version(&self) -> BlockVersion {
+        match self.0 {
+            CompressedBlock::V1(_) => BlockVersion::V1,
+        }
+    }
+
     async fn id(&self) -> BlockId {
         let bytes: fuel_types::Bytes32 = self.0.header().id().into();
         bytes.into()
+    }
+
+    async fn height(&self) -> U32 {
+        let height: u32 = (*self.0.header().height()).into();
+        height.into()
     }
 
     async fn header(&self) -> Header {
         self.0.header().clone().into()
     }
 
+    #[graphql(complexity = "query_costs().storage_read + child_complexity")]
     async fn consensus(&self, ctx: &Context<'_>) -> async_graphql::Result<Consensus> {
-        let query: &Database = ctx.data_unchecked();
-        let id = self.0.header().id();
-        let consensus = query.consensus(&id)?;
-
-        Ok(consensus.into())
+        let query = ctx.read_view()?;
+        let height = self.0.header().height();
+        Ok(query.consensus(height)?.try_into()?)
     }
 
+    #[graphql(complexity = "query_costs().block_transactions_ids")]
+    async fn transaction_ids(&self) -> Vec<TransactionId> {
+        self.0
+            .transactions()
+            .iter()
+            .map(|tx_id| (*tx_id).into())
+            .collect()
+    }
+
+    // Assume that in average we have 32 transactions per block.
+    #[graphql(complexity = "query_costs().block_transactions + child_complexity")]
     async fn transactions(
         &self,
         ctx: &Context<'_>,
     ) -> async_graphql::Result<Vec<Transaction>> {
-        let query: &Database = ctx.data_unchecked();
-        self.0
-            .transactions()
-            .iter()
-            .map(|tx_id| {
-                let tx = query.transaction(tx_id)?;
-                Ok(Transaction::from_tx(*tx_id, tx))
+        let query = ctx.read_view()?;
+        let tx_ids = futures::stream::iter(self.0.transactions().iter().copied());
+
+        let result = tx_ids
+            .chunks(query.batch_size)
+            .filter_map(move |tx_ids: Vec<TxId>| {
+                let async_query = query.as_ref().clone();
+                async move {
+                    let txs = async_query.transactions(tx_ids.clone()).await;
+                    let txs = txs
+                        .into_iter()
+                        .zip(tx_ids.into_iter())
+                        .map(|(r, tx_id)| r.map(|tx| Transaction::from_tx(tx_id, tx)));
+
+                    Some(futures::stream::iter(txs))
+                }
             })
-            .collect()
+            .flatten()
+            .try_collect()
+            .await?;
+
+        Ok(result)
     }
+}
+
+#[derive(Clone, Copy, Debug, Enum, Eq, PartialEq)]
+pub enum HeaderVersion {
+    V1,
 }
 
 #[Object]
 impl Header {
+    /// Version of the header
+    async fn version(&self) -> HeaderVersion {
+        match self.0 {
+            BlockHeader::V1(_) => HeaderVersion::V1,
+        }
+    }
+
     /// Hash of the header
     async fn id(&self) -> BlockId {
         let bytes: fuel_core_types::fuel_types::Bytes32 = self.0.id().into();
@@ -132,13 +188,23 @@ impl Header {
         self.0.da_height.0.into()
     }
 
+    /// The version of the consensus parameters used to create this block.
+    async fn consensus_parameters_version(&self) -> U32 {
+        self.0.consensus_parameters_version.into()
+    }
+
+    /// The version of the state transition bytecode used to create this block.
+    async fn state_transition_bytecode_version(&self) -> U32 {
+        self.0.state_transition_bytecode_version.into()
+    }
+
     /// Number of transactions in this block.
-    async fn transactions_count(&self) -> U64 {
+    async fn transactions_count(&self) -> U16 {
         self.0.transactions_count.into()
     }
 
     /// Number of message receipts in this block.
-    async fn message_receipt_count(&self) -> U64 {
+    async fn message_receipt_count(&self) -> U32 {
         self.0.message_receipt_count.into()
     }
 
@@ -148,8 +214,13 @@ impl Header {
     }
 
     /// Merkle root of message receipts in this block.
-    async fn message_receipt_root(&self) -> Bytes32 {
-        self.0.message_receipt_root.into()
+    async fn message_outbox_root(&self) -> Bytes32 {
+        self.0.message_outbox_root.into()
+    }
+
+    /// Merkle root of inbox events in this block.
+    async fn event_inbox_root(&self) -> Bytes32 {
+        self.0.event_inbox_root.into()
     }
 
     /// Fuel block height.
@@ -186,33 +257,39 @@ pub struct BlockQuery;
 
 #[Object]
 impl BlockQuery {
+    #[graphql(complexity = "query_costs().block_header + child_complexity")]
     async fn block(
         &self,
         ctx: &Context<'_>,
         #[graphql(desc = "ID of the block")] id: Option<BlockId>,
-        #[graphql(desc = "Height of the block")] height: Option<U64>,
+        #[graphql(desc = "Height of the block")] height: Option<U32>,
     ) -> async_graphql::Result<Option<Block>> {
-        let data: &Database = ctx.data_unchecked();
-        let id = match (id, height) {
+        let query = ctx.read_view()?;
+        let height = match (id, height) {
             (Some(_), Some(_)) => {
                 return Err(async_graphql::Error::new(
                     "Can't provide both an id and a height",
                 ))
             }
-            (Some(id), None) => Ok(id.0.into()),
+            (Some(id), None) => query.block_height(&id.0.into()),
             (None, Some(height)) => {
-                let height: u64 = height.into();
-                let height: u32 = height.try_into()?;
-                data.block_id(&height.into())
+                let height: u32 = height.into();
+                Ok(height.into())
             }
             (None, None) => {
                 return Err(async_graphql::Error::new("Missing either id or height"))
             }
         };
 
-        id.and_then(|id| data.block(&id)).into_api_result()
+        height
+            .and_then(|height| query.block(&height))
+            .into_api_result()
     }
 
+    #[graphql(complexity = "{\
+        (query_costs().block_header + child_complexity) \
+        * (first.unwrap_or_default() as usize + last.unwrap_or_default() as usize) \
+    }")]
     async fn blocks(
         &self,
         ctx: &Context<'_>,
@@ -221,9 +298,13 @@ impl BlockQuery {
         last: Option<i32>,
         before: Option<String>,
     ) -> async_graphql::Result<Connection<U32, Block, EmptyFields, EmptyFields>> {
-        let db: &Database = ctx.data_unchecked();
+        let query = ctx.read_view()?;
         crate::schema::query_pagination(after, before, first, last, |start, direction| {
-            Ok(blocks_query(db, start.map(Into::into), direction))
+            Ok(blocks_query(
+                query.as_ref(),
+                start.map(Into::into),
+                direction,
+            ))
         })
         .await
     }
@@ -234,18 +315,23 @@ pub struct HeaderQuery;
 
 #[Object]
 impl HeaderQuery {
+    #[graphql(complexity = "query_costs().block_header + child_complexity")]
     async fn header(
         &self,
         ctx: &Context<'_>,
         #[graphql(desc = "ID of the block")] id: Option<BlockId>,
-        #[graphql(desc = "Height of the block")] height: Option<U64>,
+        #[graphql(desc = "Height of the block")] height: Option<U32>,
     ) -> async_graphql::Result<Option<Header>> {
-        Ok(BlockQuery {}
+        Ok(BlockQuery
             .block(ctx, id, height)
             .await?
             .map(|b| b.0.header().clone().into()))
     }
 
+    #[graphql(complexity = "{\
+        (query_costs().block_header + child_complexity) \
+        * (first.unwrap_or_default() as usize + last.unwrap_or_default() as usize) \
+    }")]
     async fn headers(
         &self,
         ctx: &Context<'_>,
@@ -254,28 +340,30 @@ impl HeaderQuery {
         last: Option<i32>,
         before: Option<String>,
     ) -> async_graphql::Result<Connection<U32, Header, EmptyFields, EmptyFields>> {
-        let db: &Database = ctx.data_unchecked();
+        let query = ctx.read_view()?;
         crate::schema::query_pagination(after, before, first, last, |start, direction| {
-            Ok(blocks_query(db, start.map(Into::into), direction))
+            Ok(blocks_query(
+                query.as_ref(),
+                start.map(Into::into),
+                direction,
+            ))
         })
         .await
     }
 }
 
 fn blocks_query<T>(
-    query: &Database,
-    start: Option<BlockHeight>,
+    query: &ReadView,
+    height: Option<BlockHeight>,
     direction: IterDirection,
-) -> BoxedIter<StorageResult<(U32, T)>>
+) -> impl Stream<Item = StorageResult<(U32, T)>> + '_
 where
     T: async_graphql::OutputType,
     T: From<CompressedBlock>,
 {
-    let blocks = query.compressed_blocks(start, direction).map(|result| {
+    query.compressed_blocks(height, direction).map(|result| {
         result.map(|block| ((*block.header().height()).into(), block.into()))
-    });
-
-    blocks.into_boxed()
+    })
 }
 
 #[derive(Default)]
@@ -291,23 +379,23 @@ impl BlockMutation {
         &self,
         ctx: &Context<'_>,
         start_timestamp: Option<Tai64Timestamp>,
-        blocks_to_produce: U64,
+        blocks_to_produce: U32,
     ) -> async_graphql::Result<U32> {
-        let query: &Database = ctx.data_unchecked();
-        let consensus_module = ctx.data_unchecked::<ConsensusModule>();
         let config = ctx.data_unchecked::<GraphQLConfig>().clone();
 
         if !config.debug {
             return Err(anyhow!("`debug` must be enabled to use this endpoint").into())
         }
 
+        let consensus_module = ctx.data_unchecked::<ConsensusModule>();
+
         let start_time = start_timestamp.map(|timestamp| timestamp.0);
-        let blocks_to_produce: u64 = blocks_to_produce.into();
+        let blocks_to_produce: u32 = blocks_to_produce.into();
         consensus_module
-            .manually_produce_blocks(start_time, blocks_to_produce as u32)
+            .manually_produce_blocks(start_time, blocks_to_produce)
             .await?;
 
-        query
+        ctx.read_view()?
             .latest_block_height()
             .map(Into::into)
             .map_err(Into::into)
@@ -339,17 +427,21 @@ impl From<CoreGenesis> for Genesis {
             coins_root: genesis.coins_root.into(),
             contracts_root: genesis.contracts_root.into(),
             messages_root: genesis.messages_root.into(),
+            transactions_root: genesis.transactions_root.into(),
         }
     }
 }
 
-impl From<CoreConsensus> for Consensus {
-    fn from(consensus: CoreConsensus) -> Self {
+impl TryFrom<CoreConsensus> for Consensus {
+    type Error = String;
+
+    fn try_from(consensus: CoreConsensus) -> Result<Self, Self::Error> {
         match consensus {
-            CoreConsensus::Genesis(genesis) => Consensus::Genesis(genesis.into()),
-            CoreConsensus::PoA(poa) => Consensus::PoA(PoAConsensus {
+            CoreConsensus::Genesis(genesis) => Ok(Consensus::Genesis(genesis.into())),
+            CoreConsensus::PoA(poa) => Ok(Consensus::PoA(PoAConsensus {
                 signature: poa.signature.into(),
-            }),
+            })),
+            _ => Err(format!("Unknown consensus type: {:?}", consensus)),
         }
     }
 }

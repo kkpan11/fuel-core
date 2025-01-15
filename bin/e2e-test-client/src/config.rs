@@ -1,21 +1,29 @@
 use crate::SYNC_TIMEOUT;
-use fuel_core_types::fuel_vm::SecretKey;
+use fuel_core_types::{
+    fuel_tx::ContractId,
+    fuel_vm::SecretKey,
+};
 use serde::{
     Deserialize,
     Serialize,
 };
-use std::time::Duration;
+use std::{
+    str::FromStr,
+    time::Duration,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct SuiteConfig {
     /// The primary endpoint to connect to
     pub endpoint: String,
     /// Max timeout for syncing between wallets
-    /// Default is [`SYNC_TIMEOUT`](crate::SYNC_TIMEOUT)
+    /// Default is [`SYNC_TIMEOUT`]
     #[serde(with = "humantime_serde")]
     pub wallet_sync_timeout: Duration,
     /// Enable slower but more stressful tests. Should be used in full E2E tests but not in CI.
     pub full_test: bool,
+    /// The contract id of the coinbase contract.
+    pub coinbase_contract_id: ContractId,
     /// Wallet A must contain pre-existing funds
     pub wallet_a: ClientConfig,
     pub wallet_b: ClientConfig,
@@ -33,6 +41,10 @@ impl Default for SuiteConfig {
             endpoint: "http://localhost:4000".to_string(),
             wallet_sync_timeout: SYNC_TIMEOUT,
             full_test: false,
+            coinbase_contract_id: ContractId::from_str(
+                "0x7777777777777777777777777777777777777777777777777777777777777777",
+            )
+            .unwrap(),
             wallet_a: ClientConfig {
                 endpoint: None,
                 secret:

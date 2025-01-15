@@ -2,15 +2,13 @@
 source: crates/client/src/client/schema/coins.rs
 expression: operation.query
 ---
-query($utxoId: UtxoId!) {
+query CoinByIdQuery($utxoId: UtxoId!) {
   coin(utxoId: $utxoId) {
     amount
     blockCreated
+    txCreatedIdx
     assetId
     utxoId
-    maturity
     owner
   }
 }
-
-

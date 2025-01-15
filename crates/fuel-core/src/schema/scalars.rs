@@ -79,8 +79,11 @@ macro_rules! number_scalar {
     };
 }
 
+number_scalar!(U128, u128, "U128");
 number_scalar!(U64, u64, "U64");
 number_scalar!(U32, u32, "U32");
+number_scalar!(U16, u16, "U16");
+number_scalar!(U8, u8, "U8");
 
 impl From<BlockHeight> for U32 {
     fn from(h: BlockHeight) -> Self {
@@ -143,9 +146,8 @@ impl CursorType for SortedTxCursor {
             s.split_once('#').ok_or("Incorrect format provided")?;
 
         Ok(Self::new(
-            u32::from_str(block_height)
-                .map_err(|_| "Failed to decode block_height")?
-                .into(),
+            BlockHeight::from_str(block_height)
+                .map_err(|_| "Failed to decode block_height")?,
             Bytes32::decode_cursor(tx_id)?,
         ))
     }
@@ -294,9 +296,12 @@ fuel_type_scalar!("Bytes32", Bytes32, Bytes32, 32);
 fuel_type_scalar!("Address", Address, Address, 32);
 fuel_type_scalar!("BlockId", BlockId, Bytes32, 32);
 fuel_type_scalar!("AssetId", AssetId, AssetId, 32);
+fuel_type_scalar!("BlobId", BlobId, BlobId, 32);
 fuel_type_scalar!("ContractId", ContractId, ContractId, 32);
+fuel_type_scalar!("SubId", SubId, Bytes32, 32);
 fuel_type_scalar!("Salt", Salt, Salt, 32);
 fuel_type_scalar!("TransactionId", TransactionId, Bytes32, 32);
+fuel_type_scalar!("RelayedTransactionId", RelayedTransactionId, Bytes32, 32);
 fuel_type_scalar!("MessageId", MessageId, MessageId, 32);
 fuel_type_scalar!("Nonce", Nonce, Nonce, 32);
 fuel_type_scalar!("Signature", Signature, Bytes64, 64);

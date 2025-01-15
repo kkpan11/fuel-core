@@ -22,7 +22,7 @@ async fn can_submit_genesis_message() {
         da_height: DaBlockHeight(0),
     };
     let tx1 = TransactionBuilder::script(vec![op::ret(0)].into_iter().collect(), vec![])
-        .gas_limit(100000)
+        .script_gas_limit(100000)
         .add_unsigned_message_input(
             secret_key,
             msg1.sender,
@@ -32,12 +32,14 @@ async fn can_submit_genesis_message() {
         )
         .finalize_as_transaction();
 
-    let mut node_config = Config::local_node();
-    node_config.chain_conf.initial_state = Some(StateConfig {
-        messages: Some(vec![msg1]),
+    let state = StateConfig {
+        messages: vec![msg1],
         ..Default::default()
-    });
-    node_config.utxo_validation = true;
+    };
+    let node_config = Config {
+        utxo_validation: true,
+        ..Config::local_node_with_state_config(state)
+    };
 
     let srv = FuelService::new_node(node_config.clone()).await.unwrap();
     let client = FuelClient::from(srv.bound_address);

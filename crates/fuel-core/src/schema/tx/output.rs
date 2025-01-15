@@ -1,11 +1,10 @@
-use crate::schema::{
-    contract::Contract,
-    scalars::{
-        Address,
-        AssetId,
-        Bytes32,
-        U64,
-    },
+use crate::schema::scalars::{
+    Address,
+    AssetId,
+    Bytes32,
+    ContractId,
+    U16,
+    U64,
 };
 use async_graphql::{
     Object,
@@ -14,6 +13,7 @@ use async_graphql::{
 use fuel_core_types::{
     fuel_asm::Word,
     fuel_tx,
+    fuel_tx::output,
     fuel_types,
 };
 
@@ -82,15 +82,15 @@ impl VariableOutput {
 }
 
 pub struct ContractOutput {
-    input_index: u8,
+    input_index: u16,
     balance_root: fuel_types::Bytes32,
     state_root: fuel_types::Bytes32,
 }
 
 #[Object]
 impl ContractOutput {
-    async fn input_index(&self) -> u8 {
-        self.input_index
+    async fn input_index(&self) -> U16 {
+        self.input_index.into()
     }
 
     async fn balance_root(&self) -> Bytes32 {
@@ -109,7 +109,7 @@ pub struct ContractCreated {
 
 #[Object]
 impl ContractCreated {
-    async fn contract(&self) -> Contract {
+    async fn contract(&self) -> ContractId {
         self.contract_id.into()
     }
 
@@ -130,15 +130,7 @@ impl From<&fuel_tx::Output> for Output {
                 amount: *amount,
                 asset_id: *asset_id,
             }),
-            fuel_tx::Output::Contract {
-                input_index,
-                balance_root,
-                state_root,
-            } => Output::Contract(ContractOutput {
-                input_index: *input_index,
-                balance_root: *balance_root,
-                state_root: *state_root,
-            }),
+            fuel_tx::Output::Contract(contract) => Output::Contract(contract.into()),
             fuel_tx::Output::Change {
                 to,
                 amount,
@@ -164,6 +156,21 @@ impl From<&fuel_tx::Output> for Output {
                 contract_id: *contract_id,
                 state_root: *state_root,
             }),
+        }
+    }
+}
+
+impl From<&output::contract::Contract> for ContractOutput {
+    fn from(value: &output::contract::Contract) -> Self {
+        let output::contract::Contract {
+            input_index,
+            balance_root,
+            state_root,
+        } = value;
+        ContractOutput {
+            input_index: *input_index,
+            balance_root: *balance_root,
+            state_root: *state_root,
         }
     }
 }

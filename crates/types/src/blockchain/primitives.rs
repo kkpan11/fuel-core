@@ -5,6 +5,7 @@ use crate::{
     fuel_crypto::SecretKey,
     fuel_types::Bytes32,
 };
+use core::array::TryFromSliceError;
 use derive_more::{
     Add,
     AsRef,
@@ -19,14 +20,17 @@ use derive_more::{
     UpperHex,
 };
 use secrecy::{
-    zeroize,
     CloneableSecret,
     DebugSecret,
 };
 use zeroize::Zeroize;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
+
 /// Empty generated fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Empty;
 
 /// A cryptographically secure hash, identifying a block.
@@ -76,6 +80,13 @@ impl AsRef<[u8]> for BlockId {
     }
 }
 
+#[cfg(feature = "random")]
+impl rand::distributions::Distribution<BlockId> for rand::distributions::Standard {
+    fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> BlockId {
+        BlockId(rng.gen())
+    }
+}
+
 /// Block height of the data availability layer
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(
@@ -111,28 +122,21 @@ impl From<usize> for DaBlockHeight {
     }
 }
 
-impl core::ops::Add<u64> for DaBlockHeight {
-    type Output = Self;
-
-    fn add(self, other: u64) -> Self::Output {
-        Self::from(self.0 + other)
+impl From<[u8; 8]> for DaBlockHeight {
+    fn from(n: [u8; 8]) -> Self {
+        DaBlockHeight(u64::from_be_bytes(n))
     }
 }
 
 impl DaBlockHeight {
     /// Convert to array of big endian bytes
-    pub fn to_bytes(self) -> [u8; 8] {
+    pub fn to_bytes(&self) -> [u8; 8] {
+        self.to_be_bytes()
+    }
+
+    /// Convert to array of big endian bytes
+    pub fn to_be_bytes(&self) -> [u8; 8] {
         self.0.to_be_bytes()
-    }
-
-    /// Convert to usize
-    pub fn to_usize(self) -> usize {
-        self.0 as usize
-    }
-
-    /// Convert to usize
-    pub fn as_usize(&self) -> usize {
-        self.0 as usize
     }
 
     /// Convert to u64
@@ -141,10 +145,15 @@ impl DaBlockHeight {
     }
 }
 
+#[cfg(feature = "random")]
+impl rand::distributions::Distribution<DaBlockHeight> for rand::distributions::Standard {
+    fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> DaBlockHeight {
+        DaBlockHeight(rng.gen())
+    }
+}
+
 /// Wrapper around [`fuel_crypto::SecretKey`] to implement [`secrecy`] marker traits
-#[derive(
-    Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroize, Deref, From,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroize, Deref, From)]
 #[repr(transparent)]
 pub struct SecretKeyWrapper(SecretKey);
 
@@ -160,5 +169,19 @@ impl From<BlockId> for [u8; 32] {
 impl From<[u8; 32]> for BlockId {
     fn from(bytes: [u8; 32]) -> Self {
         Self(bytes.into())
+    }
+}
+
+impl AsRef<SecretKey> for SecretKeyWrapper {
+    fn as_ref(&self) -> &SecretKey {
+        &self.0
+    }
+}
+
+impl TryFrom<&'_ [u8]> for BlockId {
+    type Error = TryFromSliceError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        Ok(Self::from(TryInto::<[u8; 32]>::try_into(bytes)?))
     }
 }

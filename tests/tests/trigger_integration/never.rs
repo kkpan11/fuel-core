@@ -18,6 +18,7 @@ use fuel_core_types::{
     fuel_crypto::SecretKey,
     fuel_tx::TransactionBuilder,
     secrecy::Secret,
+    signer::SignMode,
 };
 use rand::{
     rngs::StdRng,
@@ -30,7 +31,8 @@ async fn poa_never_trigger_doesnt_produce_blocks() {
     let db = Database::default();
     let mut config = Config::local_node();
     config.block_production = Trigger::Never;
-    config.consensus_key = Some(Secret::new(SecretKey::random(&mut rng).into()));
+    config.consensus_signer =
+        SignMode::Key(Secret::new(SecretKey::random(&mut rng).into()));
     let srv = FuelService::from_database(db.clone(), config)
         .await
         .unwrap();
@@ -39,14 +41,14 @@ async fn poa_never_trigger_doesnt_produce_blocks() {
     for i in 0..10 {
         let tx =
             TransactionBuilder::script([op::movi(0x10, i)].into_iter().collect(), vec![])
-                .add_random_fee_input()
+                .add_random_fee_input(&mut rng)
                 .finalize_as_transaction();
         let _tx_id = client.submit(&tx).await.unwrap();
         tokio::time::advance(tokio::time::Duration::new(10, 0)).await;
         let resp = client
             .blocks(PaginationRequest {
                 cursor: None,
-                results: 1024,
+                results: 20,
                 direction: PageDirection::Forward,
             })
             .await

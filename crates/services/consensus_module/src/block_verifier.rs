@@ -1,17 +1,10 @@
 //! The module provides the functionality that verifies the blocks and headers based
 //! on the used consensus.
 
-pub mod config;
-
-#[cfg(test)]
-mod tests;
-
 use crate::block_verifier::config::Config;
 use anyhow::ensure;
-use fuel_core_poa::ports::{
-    Database as PoAVerifierDatabase,
-    RelayerPort,
-};
+use fuel_core_poa::ports::Database as PoAVerifierDatabase;
+use fuel_core_storage::transactional::AtomicView;
 use fuel_core_types::{
     blockchain::{
         block::Block,
@@ -27,28 +20,31 @@ use fuel_core_types::{
     tai64::Tai64,
 };
 
+pub mod config;
+
+#[cfg(test)]
+mod tests;
+
 /// Verifier is responsible for validation of the blocks and headers.
-pub struct Verifier<D, R> {
+pub struct Verifier<V> {
     config: Config,
-    database: D,
-    relayer: R,
+    view_provider: V,
 }
 
-impl<D, R> Verifier<D, R> {
+impl<V> Verifier<V> {
     /// Creates a new instance of the verifier.
-    pub fn new(config: Config, database: D, relayer: R) -> Self {
+    pub fn new(config: Config, view_provider: V) -> Self {
         Self {
             config,
-            database,
-            relayer,
+            view_provider,
         }
     }
 }
 
-impl<D, R> Verifier<D, R>
+impl<V> Verifier<V>
 where
-    D: PoAVerifierDatabase,
-    R: RelayerPort,
+    V: AtomicView,
+    V::LatestView: PoAVerifierDatabase,
 {
     /// Verifies **all** fields of the block based on used consensus to produce a block.
     ///
@@ -60,18 +56,19 @@ where
     ) -> anyhow::Result<()> {
         match consensus {
             Consensus::Genesis(_) => {
-                let expected_genesis_height = self
-                    .config
-                    .chain_config
-                    .initial_state
-                    .as_ref()
-                    .map(|config| config.height.unwrap_or_else(|| 0u32.into()))
-                    .unwrap_or_else(|| 0u32.into());
-                verify_genesis_block_fields(expected_genesis_height, block.header())
+                let expected_genesis_height = self.config.block_height;
+                let expected_genesis_da_height = self.config.da_block_height;
+                verify_genesis_block_fields(
+                    expected_genesis_height,
+                    expected_genesis_da_height,
+                    block.header(),
+                )
             }
             Consensus::PoA(_) => {
-                fuel_core_poa::verifier::verify_block_fields(&self.database, block)
+                let view = self.view_provider.latest_view()?;
+                fuel_core_poa::verifier::verify_block_fields(&view, block)
             }
+            _ => Err(anyhow::anyhow!("Unsupported consensus: {:?}", consensus)),
         }
     }
 
@@ -84,28 +81,18 @@ where
         match consensus {
             Consensus::Genesis(_) => true,
             Consensus::PoA(consensus) => fuel_core_poa::verifier::verify_consensus(
-                &self.config.chain_config.consensus,
+                &self.config.consensus,
                 header,
                 consensus,
             ),
+            _ => false,
         }
-    }
-
-    /// Wait for the relayer to be in sync with the given DA height
-    /// if the `da_height` is within the range of the current
-    /// relayer sync'd height - `max_da_lag`.
-    pub async fn await_da_height(&self, da_height: &DaBlockHeight) -> anyhow::Result<()> {
-        tokio::time::timeout(
-            self.config.relayer.max_wait_time,
-            self.relayer
-                .await_until_if_in_range(da_height, &self.config.relayer.max_da_lag),
-        )
-        .await?
     }
 }
 
 fn verify_genesis_block_fields(
     expected_genesis_height: BlockHeight,
+    expected_genesis_da_height: DaBlockHeight,
     header: &BlockHeader,
 ) -> anyhow::Result<()> {
     let actual_genesis_height = *header.height();
@@ -119,8 +106,7 @@ fn verify_genesis_block_fields(
         "The genesis time should be unix epoch time"
     );
     ensure!(
-        // TODO: Set `da_height` based on the chain config.
-        header.da_height == Default::default(),
+        header.da_height == expected_genesis_da_height,
         "The genesis `da_height` is not as expected"
     );
     ensure!(

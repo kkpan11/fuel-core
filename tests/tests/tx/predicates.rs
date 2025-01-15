@@ -11,9 +11,13 @@ use fuel_core_types::{
         *,
     },
     fuel_types::ChainId,
-    fuel_vm::checked_transaction::{
-        CheckPredicateParams,
-        EstimatePredicates,
+    fuel_vm::{
+        checked_transaction::{
+            CheckPredicateParams,
+            EstimatePredicates,
+        },
+        interpreter::MemoryInstance,
+        predicate::EmptyStorage,
     },
 };
 use rand::{
@@ -32,7 +36,7 @@ async fn transaction_with_valid_predicate_is_executed() {
     let asset_id = rng.gen();
     // make predicate return 1 which mean valid
     let predicate = op::ret(RegId::ONE).to_bytes().to_vec();
-    let owner = Input::predicate_owner(&predicate, &ChainId::default());
+    let owner = Input::predicate_owner(&predicate);
     let mut predicate_tx =
         TransactionBuilder::script(Default::default(), Default::default())
             .add_input(Input::coin_predicate(
@@ -42,27 +46,38 @@ async fn transaction_with_valid_predicate_is_executed() {
                 asset_id,
                 Default::default(),
                 Default::default(),
-                Default::default(),
                 predicate,
                 vec![],
             ))
             .add_output(Output::change(rng.gen(), 0, asset_id))
-            .gas_limit(limit)
+            .script_gas_limit(limit)
             .finalize();
-
-    assert_eq!(predicate_tx.inputs()[0].predicate_gas_used().unwrap(), 0);
-
-    predicate_tx
-        .estimate_predicates(&CheckPredicateParams::default())
-        .expect("Predicate check failed");
-
-    assert_ne!(predicate_tx.inputs()[0].predicate_gas_used().unwrap(), 0);
 
     // create test context with predicates disabled
     let context = TestSetupBuilder::default()
         .config_coin_inputs_from_transactions(&[&predicate_tx])
         .finalize()
         .await;
+
+    assert_eq!(predicate_tx.inputs()[0].predicate_gas_used().unwrap(), 0);
+
+    predicate_tx
+        .estimate_predicates(
+            &CheckPredicateParams::from(
+                &context
+                    .srv
+                    .shared
+                    .config
+                    .snapshot_reader
+                    .chain_config()
+                    .consensus_parameters,
+            ),
+            MemoryInstance::new(),
+            &EmptyStorage,
+        )
+        .expect("Predicate check failed");
+
+    assert_ne!(predicate_tx.inputs()[0].predicate_gas_used().unwrap(), 0);
 
     let predicate_tx = predicate_tx.into();
     context
@@ -72,13 +87,15 @@ async fn transaction_with_valid_predicate_is_executed() {
         .unwrap();
 
     // check transaction change amount to see if predicate was spent
-    let transaction = context
+    let transaction: Transaction = context
         .client
         .transaction(&predicate_tx.id(&ChainId::default()))
         .await
         .unwrap()
         .unwrap()
-        .transaction;
+        .transaction
+        .try_into()
+        .unwrap();
 
     assert!(
         matches!(transaction.as_script().unwrap().outputs()[0], Output::Change { amount: change_amount, .. } if change_amount == amount)
@@ -94,14 +111,13 @@ async fn transaction_with_invalid_predicate_is_rejected() {
     let asset_id = rng.gen();
     // make predicate return 0 which means invalid
     let predicate = op::ret(RegId::ZERO).to_bytes().to_vec();
-    let owner = Input::predicate_owner(&predicate, &ChainId::default());
+    let owner = Input::predicate_owner(&predicate);
     let predicate_tx = TransactionBuilder::script(Default::default(), Default::default())
         .add_input(Input::coin_predicate(
             rng.gen(),
             owner,
             amount,
             asset_id,
-            Default::default(),
             Default::default(),
             Default::default(),
             predicate,
@@ -130,14 +146,13 @@ async fn transaction_with_predicates_that_exhaust_gas_limit_are_rejected() {
     let asset_id = rng.gen();
     // make predicate jump in infinite loop
     let predicate = op::jmp(RegId::ZERO).to_bytes().to_vec();
-    let owner = Input::predicate_owner(&predicate, &ChainId::default());
+    let owner = Input::predicate_owner(&predicate);
     let predicate_tx = TransactionBuilder::script(Default::default(), Default::default())
         .add_input(Input::coin_predicate(
             rng.gen(),
             owner,
             amount,
             asset_id,
-            Default::default(),
             Default::default(),
             Default::default(),
             predicate,
@@ -159,7 +174,8 @@ async fn transaction_with_predicates_that_exhaust_gas_limit_are_rejected() {
         .expect_err("expected tx to fail");
 
     assert!(
-        err.to_string().contains("PredicateExhaustedGas"),
+        err.to_string()
+            .contains("PredicateVerificationFailed(OutOfGas)"),
         "got unexpected error {err}"
     )
 }

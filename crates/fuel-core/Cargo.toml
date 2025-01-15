@@ -12,18 +12,23 @@ version = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }
-async-graphql = { version = "4.0", features = [
-    "tracing",
+async-graphql = { version = "7.0.11", features = [
+  "graphiql",
+  "tracing",
 ], default-features = false }
+async-graphql-value = "7.0.11"
 async-trait = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+cosmrs = { version = "0.21", optional = true }
 derive_more = { version = "0.99" }
-enum-iterator = "1.2"
-fuel-core-chain-config = { workspace = true }
+enum-iterator = { workspace = true }
+fuel-core-chain-config = { workspace = true, features = ["std"] }
+fuel-core-compression = { workspace = true }
 fuel-core-consensus-module = { workspace = true }
 fuel-core-database = { workspace = true }
-fuel-core-executor = { workspace = true }
+fuel-core-executor = { workspace = true, features = ["std"] }
+fuel-core-gas-price-service = { workspace = true }
 fuel-core-importer = { workspace = true }
 fuel-core-metrics = { workspace = true }
 fuel-core-p2p = { workspace = true, optional = true }
@@ -31,42 +36,56 @@ fuel-core-poa = { workspace = true }
 fuel-core-producer = { workspace = true }
 fuel-core-relayer = { workspace = true, optional = true }
 fuel-core-services = { workspace = true }
+fuel-core-shared-sequencer = { workspace = true, optional = true }
 fuel-core-storage = { workspace = true }
 fuel-core-sync = { workspace = true, optional = true }
 fuel-core-txpool = { workspace = true }
-fuel-core-types = { workspace = true, features = [
-    "serde",
-] }
+fuel-core-types = { workspace = true, features = ["alloc", "serde"] }
+fuel-core-upgradable-executor = { workspace = true }
 futures = { workspace = true }
-hex = { version = "0.4", features = ["serde"] }
+hex = { workspace = true }
 hyper = { workspace = true }
+indicatif = { workspace = true, default-features = true }
 itertools = { workspace = true }
-parking_lot = { workspace = true }
-postcard = { workspace = true, features = ["use-std"] }
-primitive-types = "0.12"
+num_cpus = { version = "1.16.0", optional = true }
+paste = { workspace = true }
+postcard = { workspace = true, optional = true }
 rand = { workspace = true }
 rocksdb = { version = "0.21", default-features = false, features = [
-    "lz4",
-    "multi-threaded-cf",
+  "lz4",
+  "multi-threaded-cf",
 ], optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
-strum = "0.24"
-strum_macros = "0.24"
+strum = { workspace = true, features = ["derive"] }
+strum_macros = { workspace = true }
 tempfile = { workspace = true, optional = true }
 thiserror = "1.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-rayon = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
-tower-http = { version = "0.3", features = ["set-header", "trace"] }
+tokio-util = { workspace = true }
+tower = { version = "0.4", features = ["limit"] }
+tower-http = { version = "0.4", features = ["set-header", "trace", "timeout"] }
 tracing = { workspace = true }
+url = { workspace = true }
 uuid = { version = "1.1", features = ["v4"] }
 
 [dev-dependencies]
 assert_matches = "1.5"
+fuel-core = { path = ".", features = ["smt", "test-helpers"] }
+fuel-core-executor = { workspace = true, features = [
+  "std",
+  "test-helpers",
+  "limited-tx-count",
+] }
 fuel-core-services = { path = "./../services", features = ["test-helpers"] }
 fuel-core-storage = { path = "./../storage", features = ["test-helpers"] }
 fuel-core-trace = { path = "./../trace" }
 fuel-core-types = { path = "./../types", features = ["test-helpers"] }
+fuel-core-upgradable-executor = { workspace = true, features = [
+  "test-helpers",
+] }
 mockall = { workspace = true }
 proptest = { workspace = true }
 test-case = { workspace = true }
@@ -74,9 +93,28 @@ test-strategy = { workspace = true }
 
 [features]
 default = ["rocksdb"]
+smt = [
+  "fuel-core-storage/smt",
+  "fuel-core-executor/smt",
+  "fuel-core-upgradable-executor/smt",
+]
 p2p = ["dep:fuel-core-p2p", "dep:fuel-core-sync"]
 relayer = ["dep:fuel-core-relayer"]
-rocksdb = ["dep:rocksdb", "dep:tempfile"]
-test-helpers = ["fuel-core-p2p?/test-helpers"]
+shared-sequencer = ["dep:fuel-core-shared-sequencer", "dep:cosmrs"]
+rocksdb = ["dep:rocksdb", "dep:tempfile", "dep:num_cpus", "dep:postcard"]
+backup = ["rocksdb", "fuel-core-database/backup"]
+test-helpers = [
+  "fuel-core-database/test-helpers",
+  "fuel-core-p2p?/test-helpers",
+  "fuel-core-storage/test-helpers",
+  "fuel-core-chain-config/test-helpers",
+  "fuel-core-compression/test-helpers",
+  "fuel-core-txpool/test-helpers",
+  "fuel-core-services/test-helpers",
+  "fuel-core-shared-sequencer?/test-helpers",
+  "fuel-core-importer/test-helpers",
+]
 # features to enable in production, but increase build times
 rocksdb-production = ["rocksdb", "rocksdb/jemalloc"]
+wasm-executor = ["fuel-core-upgradable-executor/wasm-executor"]
+fault-proving = ["fuel-core-compression/fault-proving"]
