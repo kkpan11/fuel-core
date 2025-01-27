@@ -1,5 +1,3 @@
-use std::ops::Deref;
-
 use super::{
     block::Header,
     scalars::{
@@ -10,10 +8,11 @@ use super::{
         TransactionId,
         U64,
     },
+    ReadViewProvider,
 };
 use crate::{
-    fuel_core_graphql_api::service::Database,
-    query::MessageQueryData,
+    fuel_core_graphql_api::query_costs,
+    graphql_api::IntoApiResult,
     schema::scalars::{
         BlockId,
         U32,
@@ -29,34 +28,36 @@ use async_graphql::{
     Enum,
     Object,
 };
+use fuel_core_services::stream::IntoBoxStream;
 use fuel_core_types::entities;
+use futures::StreamExt;
 
-pub struct Message(pub(crate) entities::message::Message);
+pub struct Message(pub(crate) entities::relayer::message::Message);
 
 #[Object]
 impl Message {
     async fn amount(&self) -> U64 {
-        self.0.amount.into()
+        self.0.amount().into()
     }
 
     async fn sender(&self) -> Address {
-        self.0.sender.into()
+        (*self.0.sender()).into()
     }
 
     async fn recipient(&self) -> Address {
-        self.0.recipient.into()
+        (*self.0.recipient()).into()
     }
 
     async fn nonce(&self) -> Nonce {
-        self.0.nonce.into()
+        (*self.0.nonce()).into()
     }
 
     async fn data(&self) -> HexString {
-        self.0.data.clone().into()
+        self.0.data().clone().into()
     }
 
     async fn da_height(&self) -> U64 {
-        self.0.da_height.as_u64().into()
+        self.0.da_height().as_u64().into()
     }
 }
 
@@ -65,6 +66,22 @@ pub struct MessageQuery {}
 
 #[Object]
 impl MessageQuery {
+    #[graphql(complexity = "query_costs().storage_read + child_complexity")]
+    async fn message(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "The Nonce of the message")] nonce: Nonce,
+    ) -> async_graphql::Result<Option<Message>> {
+        let query = ctx.read_view()?;
+        let nonce = nonce.0;
+        query.message(&nonce).into_api_result()
+    }
+
+    #[graphql(complexity = "{\
+        query_costs().storage_iterator\
+        + (query_costs().storage_read + first.unwrap_or_default() as usize) * child_complexity \
+        + (query_costs().storage_read + last.unwrap_or_default() as usize) * child_complexity\
+    }")]
     async fn messages(
         &self,
         ctx: &Context<'_>,
@@ -75,7 +92,9 @@ impl MessageQuery {
         before: Option<String>,
     ) -> async_graphql::Result<Connection<HexString, Message, EmptyFields, EmptyFields>>
     {
-        let query: &Database = ctx.data_unchecked();
+        let query = ctx.read_view()?;
+        let owner = owner.map(|owner| owner.0);
+        let owner_ref = owner.as_ref();
         crate::schema::query_pagination(
             after,
             before,
@@ -88,23 +107,17 @@ impl MessageQuery {
                     None
                 };
 
-                let messages = if let Some(owner) = owner {
-                    // Rocksdb doesn't support reverse iteration over a prefix
-                    if matches!(last, Some(last) if last > 0) {
-                        return Err(anyhow!(
-                            "reverse pagination isn't supported for this resource"
-                        )
-                        .into())
-                    }
-
-                    query.owned_messages(&owner.0, start, direction)
+                let messages = if let Some(owner) = owner_ref {
+                    query
+                        .owned_messages(owner, start, direction)
+                        .into_boxed_ref()
                 } else {
-                    query.all_messages(start, direction)
+                    query.all_messages(start, direction).into_boxed_ref()
                 };
 
                 let messages = messages.map(|result| {
                     result
-                        .map(|message| (message.nonce.into(), message.into()))
+                        .map(|message| ((*message.nonce()).into(), message.into()))
                         .map_err(Into::into)
                 });
 
@@ -114,6 +127,8 @@ impl MessageQuery {
         .await
     }
 
+    // 256 * QUERY_COSTS.storage_read because the depth of the Merkle tree in the worst case is 256
+    #[graphql(complexity = "256 * query_costs().storage_read + child_complexity")]
     async fn message_proof(
         &self,
         ctx: &Context<'_>,
@@ -121,39 +136,42 @@ impl MessageQuery {
         nonce: Nonce,
         commit_block_id: Option<BlockId>,
         commit_block_height: Option<U32>,
-    ) -> async_graphql::Result<Option<MessageProof>> {
-        let data: &Database = ctx.data_unchecked();
-        let block_id = match (commit_block_id, commit_block_height) {
-            (Some(commit_block_id), None) => commit_block_id.0.into(),
+    ) -> async_graphql::Result<MessageProof> {
+        let query = ctx.read_view()?;
+        let height = match (commit_block_id, commit_block_height) {
+            (Some(commit_block_id), None) => {
+                query.block_height(&commit_block_id.0.into())?
+            },
             (None, Some(commit_block_height)) => {
-                let block_height = commit_block_height.0.into();
-                data.block_id(&block_height)?
+                commit_block_height.0.into()
             }
             _ => Err(anyhow::anyhow!(
                 "Either `commit_block_id` or `commit_block_height` must be provided exclusively"
             ))?,
         };
 
-        Ok(crate::query::message_proof(
-            data.deref(),
+        let proof = crate::query::message_proof(
+            query.as_ref(),
             transaction_id.into(),
             nonce.into(),
-            block_id,
-        )?
-        .map(MessageProof))
+            height,
+        )?;
+
+        Ok(MessageProof(proof))
     }
 
+    #[graphql(complexity = "query_costs().storage_read + child_complexity")]
     async fn message_status(
         &self,
         ctx: &Context<'_>,
         nonce: Nonce,
     ) -> async_graphql::Result<MessageStatus> {
-        let data: &Database = ctx.data_unchecked();
-        let status = crate::query::message_status(data.deref(), nonce.into())?;
+        let query = ctx.read_view()?;
+        let status = crate::query::message_status(query.as_ref(), nonce.into())?;
         Ok(status.into())
     }
 }
-pub struct MerkleProof(pub(crate) entities::message::MerkleProof);
+pub struct MerkleProof(pub(crate) entities::relayer::message::MerkleProof);
 
 #[Object]
 impl MerkleProof {
@@ -171,7 +189,7 @@ impl MerkleProof {
     }
 }
 
-pub struct MessageProof(pub(crate) entities::message::MessageProof);
+pub struct MessageProof(pub(crate) entities::relayer::message::MessageProof);
 
 #[Object]
 impl MessageProof {
@@ -212,19 +230,19 @@ impl MessageProof {
     }
 }
 
-impl From<entities::message::Message> for Message {
-    fn from(message: entities::message::Message) -> Self {
+impl From<entities::relayer::message::Message> for Message {
+    fn from(message: entities::relayer::message::Message) -> Self {
         Message(message)
     }
 }
 
-impl From<entities::message::MerkleProof> for MerkleProof {
-    fn from(proof: entities::message::MerkleProof) -> Self {
+impl From<entities::relayer::message::MerkleProof> for MerkleProof {
+    fn from(proof: entities::relayer::message::MerkleProof) -> Self {
         MerkleProof(proof)
     }
 }
 
-pub struct MessageStatus(pub(crate) entities::message::MessageStatus);
+pub struct MessageStatus(pub(crate) entities::relayer::message::MessageStatus);
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq)]
 enum MessageState {
@@ -237,15 +255,15 @@ enum MessageState {
 impl MessageStatus {
     async fn state(&self) -> MessageState {
         match self.0.state {
-            entities::message::MessageState::Unspent => MessageState::Unspent,
-            entities::message::MessageState::Spent => MessageState::Spent,
-            entities::message::MessageState::NotFound => MessageState::NotFound,
+            entities::relayer::message::MessageState::Unspent => MessageState::Unspent,
+            entities::relayer::message::MessageState::Spent => MessageState::Spent,
+            entities::relayer::message::MessageState::NotFound => MessageState::NotFound,
         }
     }
 }
 
-impl From<entities::message::MessageStatus> for MessageStatus {
-    fn from(status: entities::message::MessageStatus) -> Self {
+impl From<entities::relayer::message::MessageStatus> for MessageStatus {
+    fn from(status: entities::relayer::message::MessageStatus) -> Self {
         MessageStatus(status)
     }
 }

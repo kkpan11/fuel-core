@@ -1,15 +1,16 @@
 use fuel_core_services::stream::BoxStream;
 use fuel_core_storage::{
-    transactional::StorageTransaction,
+    transactional::Changes,
     Result as StorageResult,
 };
 use fuel_core_types::{
     blockchain::{
+        block::Block,
+        consensus::Consensus,
         header::BlockHeader,
         primitives::DaBlockHeight,
     },
-    fuel_asm::Word,
-    fuel_tx::TxId,
+    fuel_tx::Transaction,
     fuel_types::{
         BlockHeight,
         Bytes32,
@@ -20,49 +21,57 @@ use fuel_core_types::{
             UncommittedResult as UncommittedImportResult,
         },
         executor::UncommittedResult as UncommittedExecutionResult,
-        txpool::ArcPoolTx,
     },
     tai64::Tai64,
 };
+use std::collections::HashMap;
 
 #[cfg_attr(test, mockall::automock)]
 pub trait TransactionPool: Send + Sync {
-    /// Returns the number of pending transactions in the `TxPool`.
-    fn pending_number(&self) -> usize;
+    fn new_txs_watcher(&self) -> tokio::sync::watch::Receiver<()>;
 
-    fn total_consumable_gas(&self) -> u64;
-
-    fn remove_txs(&self, tx_ids: Vec<TxId>) -> Vec<ArcPoolTx>;
-
-    fn transaction_status_events(&self) -> BoxStream<TxId>;
+    fn notify_skipped_txs(&self, tx_ids_and_reasons: Vec<(Bytes32, String)>);
 }
 
-#[cfg(test)]
-use fuel_core_storage::test_helpers::EmptyStorage;
+/// The source of transactions for the block.
+pub enum TransactionsSource {
+    /// The source of transactions for the block is the `TxPool`.
+    TxPool,
+    /// Use specific transactions for the block.
+    SpecificTransactions(Vec<Transaction>),
+}
 
-#[cfg_attr(test, mockall::automock(type Database=EmptyStorage;))]
+#[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait BlockProducer: Send + Sync {
-    type Database;
-
     async fn produce_and_execute_block(
         &self,
         height: BlockHeight,
         block_time: Tai64,
-        max_gas: Word,
-    ) -> anyhow::Result<UncommittedExecutionResult<StorageTransaction<Self::Database>>>;
+        source: TransactionsSource,
+    ) -> anyhow::Result<UncommittedExecutionResult<Changes>>;
+
+    async fn produce_predefined_block(
+        &self,
+        block: &Block,
+    ) -> anyhow::Result<UncommittedExecutionResult<Changes>>;
 }
 
-#[cfg_attr(test, mockall::automock(type Database=EmptyStorage;))]
+#[cfg_attr(test, mockall::automock)]
+#[async_trait::async_trait]
 pub trait BlockImporter: Send + Sync {
-    type Database;
-
-    fn commit_result(
+    async fn commit_result(
         &self,
-        result: UncommittedImportResult<StorageTransaction<Self::Database>>,
+        result: UncommittedImportResult<Changes>,
     ) -> anyhow::Result<()>;
 
     fn block_stream(&self) -> BoxStream<BlockImportInfo>;
+}
+
+#[async_trait::async_trait]
+pub trait BlockSigner: Send + Sync {
+    async fn seal_block(&self, block: &Block) -> anyhow::Result<Consensus>;
+    fn is_available(&self) -> bool;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -100,4 +109,34 @@ pub trait P2pPort: Send + Sync + 'static {
 pub trait SyncPort: Send + Sync {
     /// await synchronization with the peers
     async fn sync_with_peers(&mut self) -> anyhow::Result<()>;
+}
+
+pub trait PredefinedBlocks: Send + Sync {
+    fn get_block(&self, height: &BlockHeight) -> anyhow::Result<Option<Block>>;
+}
+
+pub struct InMemoryPredefinedBlocks {
+    blocks: HashMap<BlockHeight, Block>,
+}
+
+impl From<HashMap<BlockHeight, Block>> for InMemoryPredefinedBlocks {
+    fn from(blocks: HashMap<BlockHeight, Block>) -> Self {
+        Self::new(blocks)
+    }
+}
+
+impl InMemoryPredefinedBlocks {
+    pub fn new(blocks: HashMap<BlockHeight, Block>) -> Self {
+        Self { blocks }
+    }
+}
+
+impl PredefinedBlocks for InMemoryPredefinedBlocks {
+    fn get_block(&self, height: &BlockHeight) -> anyhow::Result<Option<Block>> {
+        Ok(self.blocks.get(height).cloned())
+    }
+}
+
+pub trait GetTime: Send + Sync {
+    fn now(&self) -> Tai64;
 }

@@ -1,443 +1,284 @@
 use crate::{
-    database::transaction::DatabaseTransaction,
+    database::{
+        database_description::{
+            off_chain::OffChain,
+            on_chain::OnChain,
+            relayer::Relayer,
+            DatabaseDescription,
+            DatabaseHeight,
+            DatabaseMetadata,
+        },
+        metadata::MetadataTable,
+        Error as DatabaseError,
+    },
+    graphql_api::storage::blocks::FuelBlockIdsToHeights,
     state::{
+        data_source::{
+            DataSource,
+            DataSourceType,
+        },
+        generic_database::GenericDatabase,
         in_memory::memory_store::MemoryStore,
-        DataSource,
-        WriteOperation,
+        ColumnType,
+        IterableKeyValueView,
+        KeyValueView,
     },
 };
-use fuel_core_chain_config::{
-    ChainConfigDb,
-    CoinConfig,
-    ContractConfig,
-    MessageConfig,
-};
+use fuel_core_chain_config::TableEntry;
+use fuel_core_gas_price_service::common::fuel_core_storage_adapter::storage::GasPriceMetadata;
+use fuel_core_services::SharedMutex;
 use fuel_core_storage::{
-    iter::IterDirection,
+    self,
+    iter::{
+        changes_iterator::ChangesIterator,
+        IterDirection,
+        IterableTable,
+        IteratorOverTable,
+    },
+    not_found,
+    tables::FuelBlocks,
     transactional::{
+        AtomicView,
+        Changes,
+        ConflictPolicy,
+        HistoricalView,
+        Modifiable,
         StorageTransaction,
-        Transactional,
     },
+    Error as StorageError,
+    Mappable,
     Result as StorageResult,
+    StorageAsMut,
+    StorageInspect,
+    StorageMutate,
 };
-use fuel_core_types::fuel_types::BlockHeight;
+use fuel_core_types::{
+    blockchain::block::CompressedBlock,
+    fuel_types::BlockHeight,
+};
 use itertools::Itertools;
-use serde::{
-    de::DeserializeOwned,
-    Serialize,
-};
 use std::{
-    fmt::{
-        self,
-        Debug,
-        Formatter,
-    },
-    marker::Send,
-    ops::Deref,
+    borrow::Cow,
+    fmt::Debug,
     sync::Arc,
 };
 
 pub use fuel_core_database::Error;
 pub type Result<T> = core::result::Result<T, Error>;
 
-type DatabaseError = Error;
-type DatabaseResult<T> = Result<T>;
-
 // TODO: Extract `Database` and all belongs into `fuel-core-database`.
+use crate::database::database_description::{
+    gas_price::GasPriceDatabase,
+    indexation_availability,
+};
 #[cfg(feature = "rocksdb")]
-use crate::state::rocks_db::RocksDb;
+use crate::state::{
+    historical_rocksdb::{
+        description::Historical,
+        HistoricalRocksDB,
+        StateRewindPolicy,
+    },
+    rocks_db::{
+        ColumnsPolicy,
+        DatabaseConfig,
+        RocksDb,
+    },
+};
 #[cfg(feature = "rocksdb")]
 use std::path::Path;
-use strum::EnumCount;
-#[cfg(feature = "rocksdb")]
-use tempfile::TempDir;
 
 // Storages implementation
-// TODO: Move to separate `database/storage` folder, because it is only implementation of storages traits.
-mod block;
-mod code_root;
-mod contracts;
-mod message;
-mod receipts;
-#[cfg(feature = "relayer")]
-mod relayer;
-mod sealed_block;
-mod state;
-
-pub(crate) mod coin;
-
 pub mod balances;
+pub mod block;
+pub mod coin;
+pub mod contracts;
+pub mod database_description;
+pub mod genesis_progress;
+pub mod message;
 pub mod metadata;
+pub mod sealed_block;
+pub mod state;
+#[cfg(feature = "test-helpers")]
 pub mod storage;
-pub mod transaction;
 pub mod transactions;
-pub mod vm_database;
 
-/// Database tables column ids to the corresponding [`fuel_core_storage::Mappable`] table.
-#[repr(u32)]
-#[derive(
-    Copy, Clone, Debug, strum_macros::EnumCount, PartialEq, Eq, enum_iterator::Sequence,
-)]
-pub enum Column {
-    /// The column id of metadata about the blockchain
-    Metadata = 0,
-    /// See [`ContractsRawCode`](fuel_core_storage::tables::ContractsRawCode)
-    ContractsRawCode = 1,
-    /// See [`ContractsInfo`](fuel_core_storage::tables::ContractsInfo)
-    ContractsInfo = 2,
-    /// See [`ContractsState`](fuel_core_storage::tables::ContractsState)
-    ContractsState = 3,
-    /// See [`ContractsLatestUtxo`](fuel_core_storage::tables::ContractsLatestUtxo)
-    ContractsLatestUtxo = 4,
-    /// See [`ContractsAssets`](fuel_core_storage::tables::ContractsAssets)
-    ContractsAssets = 5,
-    /// See [`Coins`](fuel_core_storage::tables::Coins)
-    Coins = 6,
-    /// The column of the table that stores `true` if `owner` owns `Coin` with `coin_id`
-    OwnedCoins = 7,
-    /// See [`Transactions`](fuel_core_storage::tables::Transactions)
-    Transactions = 8,
-    /// Transaction id to current status
-    TransactionStatus = 9,
-    /// The column of the table of all `owner`'s transactions
-    TransactionsByOwnerBlockIdx = 10,
-    /// See [`Receipts`](fuel_core_storage::tables::Receipts)
-    Receipts = 11,
-    /// See [`FuelBlocks`](fuel_core_storage::tables::FuelBlocks)
-    FuelBlocks = 12,
-    /// See [`FuelBlockSecondaryKeyBlockHeights`](storage::FuelBlockSecondaryKeyBlockHeights)
-    FuelBlockSecondaryKeyBlockHeights = 13,
-    /// See [`Messages`](fuel_core_storage::tables::Messages)
-    Messages = 14,
-    /// The column of the table that stores `true` if `owner` owns `Message` with `message_id`
-    OwnedMessageIds = 15,
-    /// See [`SealedBlockConsensus`](fuel_core_storage::tables::SealedBlockConsensus)
-    FuelBlockConsensus = 16,
-    /// See [`FuelBlockMerkleData`](storage::FuelBlockMerkleData)
-    FuelBlockMerkleData = 17,
-    /// See [`FuelBlockMerkleMetadata`](storage::FuelBlockMerkleMetadata)
-    FuelBlockMerkleMetadata = 18,
-    /// Messages that have been spent.
-    /// Existence of a key in this column means that the message has been spent.
-    /// See [`SpentMessages`](fuel_core_storage::tables::SpentMessages)
-    SpentMessages = 19,
-    /// Metadata for the relayer
-    /// See [`RelayerMetadata`](fuel_core_relayer::ports::RelayerMetadata)
-    RelayerMetadata = 20,
-    /// See [`ContractsAssetsMerkleData`](storage::ContractsAssetsMerkleData)
-    ContractsAssetsMerkleData = 21,
-    /// See [`ContractsAssetsMerkleMetadata`](storage::ContractsAssetsMerkleMetadata)
-    ContractsAssetsMerkleMetadata = 22,
-    /// See [`ContractsStateMerkleData`](storage::ContractsStateMerkleData)
-    ContractsStateMerkleData = 23,
-    /// See [`ContractsStateMerkleMetadata`](storage::ContractsStateMerkleMetadata)
-    ContractsStateMerkleMetadata = 24,
+#[derive(Default, Debug, Copy, Clone)]
+pub struct GenesisStage;
+
+#[derive(Debug, Clone)]
+pub struct RegularStage<Description>
+where
+    Description: DatabaseDescription,
+{
+    /// Cached value from Metadata table, used to speed up lookups.
+    height: SharedMutex<Option<Description::Height>>,
 }
 
-impl Column {
-    /// The total count of variants in the enum.
-    pub const COUNT: usize = <Self as EnumCount>::COUNT;
-
-    /// Returns the `usize` representation of the `Column`.
-    pub fn as_usize(&self) -> usize {
-        *self as usize
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Database {
-    data: DataSource,
-    // used for RAII
-    _drop: Arc<DropResources>,
-}
-
-trait DropFnTrait: FnOnce() + Send + Sync {}
-impl<F> DropFnTrait for F where F: FnOnce() + Send + Sync {}
-type DropFn = Box<dyn DropFnTrait>;
-
-impl fmt::Debug for DropFn {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "DropFn")
-    }
-}
-
-#[derive(Debug, Default)]
-struct DropResources {
-    // move resources into this closure to have them dropped when db drops
-    drop: Option<DropFn>,
-}
-
-impl<F: 'static + FnOnce() + Send + Sync> From<F> for DropResources {
-    fn from(closure: F) -> Self {
+impl<Description> Default for RegularStage<Description>
+where
+    Description: DatabaseDescription,
+{
+    fn default() -> Self {
         Self {
-            drop: Option::Some(Box::new(closure)),
+            height: SharedMutex::new(None),
         }
     }
 }
 
-impl Drop for DropResources {
-    fn drop(&mut self) {
-        if let Some(drop) = self.drop.take() {
-            (drop)()
-        }
+pub type Database<Description = OnChain, Stage = RegularStage<Description>> =
+    GenericDatabase<DataSource<Description, Stage>>;
+pub type OnChainIterableKeyValueView = IterableKeyValueView<ColumnType<OnChain>>;
+pub type OffChainIterableKeyValueView = IterableKeyValueView<ColumnType<OffChain>>;
+pub type RelayerIterableKeyValueView = IterableKeyValueView<ColumnType<Relayer>>;
+
+pub type GenesisDatabase<Description = OnChain> = Database<Description, GenesisStage>;
+
+impl OnChainIterableKeyValueView {
+    pub fn maybe_latest_height(&self) -> StorageResult<Option<BlockHeight>> {
+        self.iter_all_keys::<FuelBlocks>(Some(IterDirection::Reverse))
+            .next()
+            .transpose()
+    }
+
+    pub fn latest_height(&self) -> StorageResult<BlockHeight> {
+        self.maybe_latest_height()?.ok_or(not_found!("BlockHeight"))
+    }
+
+    pub fn latest_block(&self) -> StorageResult<CompressedBlock> {
+        self.iter_all::<FuelBlocks>(Some(IterDirection::Reverse))
+            .next()
+            .transpose()?
+            .map(|(_, block)| block)
+            .ok_or_else(|| not_found!("FuelBlocks"))
     }
 }
 
-impl Database {
-    pub fn new(data_source: DataSource) -> Self {
-        Self {
-            data: data_source,
-            _drop: Default::default(),
-        }
+impl<DbDesc> Database<DbDesc>
+where
+    DbDesc: DatabaseDescription,
+{
+    pub fn entries<'a, T>(
+        &'a self,
+        prefix: Option<Vec<u8>>,
+        direction: IterDirection,
+    ) -> impl Iterator<Item = StorageResult<TableEntry<T>>> + 'a
+    where
+        T: Mappable + 'a,
+        Self: IterableTable<T>,
+    {
+        self.iter_all_filtered::<T, _>(prefix, None, Some(direction))
+            .map_ok(|(key, value)| TableEntry { key, value })
+    }
+}
+
+impl<Description> GenesisDatabase<Description>
+where
+    Description: DatabaseDescription,
+{
+    pub fn new(data_source: DataSourceType<Description>) -> Self {
+        GenesisDatabase::from_storage(DataSource::new(data_source, GenesisStage))
+    }
+}
+
+impl<Description> Database<Description>
+where
+    Description: DatabaseDescription,
+    Database<Description>:
+        StorageInspect<MetadataTable<Description>, Error = StorageError>,
+{
+    pub fn new(data_source: DataSourceType<Description>) -> Self {
+        let mut database = Self::from_storage(DataSource::new(
+            data_source,
+            RegularStage {
+                height: SharedMutex::new(None),
+            },
+        ));
+        let height = database
+            .latest_height_from_metadata()
+            .expect("Failed to get latest height during creation of the database");
+
+        database.stage.height = SharedMutex::new(height);
+
+        database
     }
 
     #[cfg(feature = "rocksdb")]
-    pub fn open(path: &Path, capacity: impl Into<Option<usize>>) -> DatabaseResult<Self> {
+    pub fn open_rocksdb(
+        path: &Path,
+        state_rewind_policy: StateRewindPolicy,
+        database_config: DatabaseConfig,
+    ) -> Result<Self> {
         use anyhow::Context;
-        let db = RocksDb::default_open(path, capacity.into()).context("Failed to open rocksdb, you may need to wipe a pre-existing incompatible db `rm -rf ~/.fuel/db`")?;
 
-        Ok(Database {
-            data: Arc::new(db),
-            _drop: Default::default(),
-        })
+        let db = HistoricalRocksDB::<Description>::default_open(
+            path,
+            state_rewind_policy,
+            database_config,
+        )
+        .map_err(Into::<anyhow::Error>::into)
+        .with_context(|| {
+            format!(
+                "Failed to open rocksdb, you may need to wipe a \
+                pre-existing incompatible db e.g. `rm -rf {path:?}`"
+            )
+        })?;
+
+        Ok(Self::new(Arc::new(db)))
     }
 
-    pub fn in_memory() -> Self {
-        Self {
-            data: Arc::new(MemoryStore::default()),
-            _drop: Default::default(),
+    /// Converts the regular database to an unchecked database.
+    ///
+    /// Returns an error in the case regular database is initialized with the `GenesisDatabase`,
+    /// to highlight that it is a bad idea and it is unsafe.
+    pub fn into_genesis(
+        self,
+    ) -> core::result::Result<GenesisDatabase<Description>, GenesisDatabase<Description>>
+    {
+        if !self.stage.height.lock().is_some() {
+            Ok(GenesisDatabase::new(self.into_inner().data))
+        } else {
+            tracing::warn!(
+                "Converting regular database into genesis, \
+                while height is already set for `{}`",
+                Description::name()
+            );
+            Err(GenesisDatabase::new(self.into_inner().data))
         }
+    }
+}
+
+impl<Description, Stage> Database<Description, Stage>
+where
+    Description: DatabaseDescription,
+    Stage: Default,
+{
+    pub fn in_memory() -> Self {
+        let data = Arc::<MemoryStore<Description>>::new(MemoryStore::default());
+        Self::from_storage(DataSource::new(data, Stage::default()))
     }
 
     #[cfg(feature = "rocksdb")]
-    pub fn rocksdb() -> Self {
-        let tmp_dir = TempDir::new().unwrap();
-        let db = RocksDb::default_open(tmp_dir.path(), None).unwrap();
-        Self {
-            data: Arc::new(db),
-            _drop: Arc::new(
-                {
-                    move || {
-                        // cleanup temp dir
-                        drop(tmp_dir);
-                    }
-                }
-                .into(),
-            ),
-        }
-    }
-
-    pub fn transaction(&self) -> DatabaseTransaction {
-        self.into()
-    }
-}
-
-/// Mutable methods.
-// TODO: Add `&mut self` to them.
-impl Database {
-    fn insert<K: AsRef<[u8]>, V: Serialize, R: DeserializeOwned>(
-        &self,
-        key: K,
-        column: Column,
-        value: &V,
-    ) -> DatabaseResult<Option<R>> {
-        let result = self.data.put(
-            key.as_ref(),
-            column,
-            Arc::new(postcard::to_stdvec(value).map_err(|_| DatabaseError::Codec)?),
+    pub fn rocksdb_temp(
+        state_rewind_policy: StateRewindPolicy,
+        database_config: DatabaseConfig,
+    ) -> Result<Self> {
+        let db = RocksDb::<Historical<Description>>::default_open_temp_with_params(
+            database_config,
         )?;
-        if let Some(previous) = result {
-            Ok(Some(
-                postcard::from_bytes(&previous).map_err(|_| DatabaseError::Codec)?,
-            ))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn batch_insert<K: AsRef<[u8]>, V: Serialize, S>(
-        &self,
-        column: Column,
-        set: S,
-    ) -> DatabaseResult<()>
-    where
-        S: Iterator<Item = (K, V)>,
-    {
-        let set: Vec<_> = set
-            .map(|(key, value)| {
-                let value =
-                    postcard::to_stdvec(&value).map_err(|_| DatabaseError::Codec)?;
-
-                let tuple = (
-                    key.as_ref().to_vec(),
-                    column,
-                    WriteOperation::Insert(Arc::new(value)),
-                );
-
-                Ok::<_, DatabaseError>(tuple)
-            })
-            .try_collect()?;
-
-        self.data.batch_write(&mut set.into_iter())
-    }
-
-    fn remove<V: DeserializeOwned>(
-        &self,
-        key: &[u8],
-        column: Column,
-    ) -> DatabaseResult<Option<V>> {
-        self.data
-            .delete(key, column)?
-            .map(|val| postcard::from_bytes(&val).map_err(|_| DatabaseError::Codec))
-            .transpose()
-    }
-
-    fn write(&self, key: &[u8], column: Column, buf: &[u8]) -> DatabaseResult<usize> {
-        self.data.write(key, column, buf)
-    }
-
-    fn replace(
-        &self,
-        key: &[u8],
-        column: Column,
-        buf: &[u8],
-    ) -> DatabaseResult<(usize, Option<Vec<u8>>)> {
-        self.data
-            .replace(key, column, buf)
-            .map(|(size, value)| (size, value.map(|value| value.deref().clone())))
-    }
-
-    fn take(&self, key: &[u8], column: Column) -> DatabaseResult<Option<Vec<u8>>> {
-        self.data
-            .take(key, column)
-            .map(|value| value.map(|value| value.deref().clone()))
-    }
-}
-
-/// Read-only methods.
-impl Database {
-    fn contains_key(&self, key: &[u8], column: Column) -> DatabaseResult<bool> {
-        self.data.exists(key, column)
-    }
-
-    fn size_of_value(&self, key: &[u8], column: Column) -> DatabaseResult<Option<usize>> {
-        self.data.size_of_value(key, column)
-    }
-
-    fn read(
-        &self,
-        key: &[u8],
-        column: Column,
-        buf: &mut [u8],
-    ) -> DatabaseResult<Option<usize>> {
-        self.data.read(key, column, buf)
-    }
-
-    fn read_alloc(&self, key: &[u8], column: Column) -> DatabaseResult<Option<Vec<u8>>> {
-        self.data
-            .read_alloc(key, column)
-            .map(|value| value.map(|value| value.deref().clone()))
-    }
-
-    fn get<V: DeserializeOwned>(
-        &self,
-        key: &[u8],
-        column: Column,
-    ) -> DatabaseResult<Option<V>> {
-        self.data
-            .get(key, column)?
-            .map(|val| postcard::from_bytes(&val).map_err(|_| DatabaseError::Codec))
-            .transpose()
-    }
-
-    fn iter_all<K, V>(
-        &self,
-        column: Column,
-        direction: Option<IterDirection>,
-    ) -> impl Iterator<Item = DatabaseResult<(K, V)>> + '_
-    where
-        K: From<Vec<u8>>,
-        V: DeserializeOwned,
-    {
-        self.iter_all_filtered::<K, V, Vec<u8>, Vec<u8>>(column, None, None, direction)
-    }
-
-    fn iter_all_by_prefix<K, V, P>(
-        &self,
-        column: Column,
-        prefix: Option<P>,
-    ) -> impl Iterator<Item = DatabaseResult<(K, V)>> + '_
-    where
-        K: From<Vec<u8>>,
-        V: DeserializeOwned,
-        P: AsRef<[u8]>,
-    {
-        self.iter_all_filtered::<K, V, P, [u8; 0]>(column, prefix, None, None)
-    }
-
-    fn iter_all_by_start<K, V, S>(
-        &self,
-        column: Column,
-        start: Option<S>,
-        direction: Option<IterDirection>,
-    ) -> impl Iterator<Item = DatabaseResult<(K, V)>> + '_
-    where
-        K: From<Vec<u8>>,
-        V: DeserializeOwned,
-        S: AsRef<[u8]>,
-    {
-        self.iter_all_filtered::<K, V, [u8; 0], S>(column, None, start, direction)
-    }
-
-    fn iter_all_filtered<K, V, P, S>(
-        &self,
-        column: Column,
-        prefix: Option<P>,
-        start: Option<S>,
-        direction: Option<IterDirection>,
-    ) -> impl Iterator<Item = DatabaseResult<(K, V)>> + '_
-    where
-        K: From<Vec<u8>>,
-        V: DeserializeOwned,
-        P: AsRef<[u8]>,
-        S: AsRef<[u8]>,
-    {
-        self.data
-            .iter_all(
-                column,
-                prefix.as_ref().map(|p| p.as_ref()),
-                start.as_ref().map(|s| s.as_ref()),
-                direction.unwrap_or_default(),
-            )
-            .map(|val| {
-                val.and_then(|(key, value)| {
-                    let key = K::from(key);
-                    let value: V =
-                        postcard::from_bytes(&value).map_err(|_| DatabaseError::Codec)?;
-                    Ok((key, value))
-                })
-            })
-    }
-}
-
-impl Transactional for Database {
-    type Storage = Database;
-
-    fn transaction(&self) -> StorageTransaction<Database> {
-        StorageTransaction::new(self.transaction())
-    }
-}
-
-impl AsRef<Database> for Database {
-    fn as_ref(&self) -> &Database {
-        self
+        let historical_db = HistoricalRocksDB::new(db, state_rewind_policy)?;
+        let data = Arc::new(historical_db);
+        Ok(Self::from_storage(DataSource::new(data, Stage::default())))
     }
 }
 
 /// Construct an ephemeral database
 /// uses rocksdb when rocksdb features are enabled
 /// uses in-memory when rocksdb features are disabled
-impl Default for Database {
+impl<Description, Stage> Default for Database<Description, Stage>
+where
+    Description: DatabaseDescription,
+    Stage: Default,
+{
     fn default() -> Self {
         #[cfg(not(feature = "rocksdb"))]
         {
@@ -445,45 +286,988 @@ impl Default for Database {
         }
         #[cfg(feature = "rocksdb")]
         {
-            Self::rocksdb()
+            Self::rocksdb_temp(
+                StateRewindPolicy::NoRewind,
+                DatabaseConfig {
+                    cache_capacity: None,
+                    max_fds: 512,
+                    columns_policy: ColumnsPolicy::Lazy,
+                },
+            )
+            .expect("Failed to create a temporary database")
         }
     }
 }
 
-/// Implement `ChainConfigDb` so that `Database` can be passed to
-/// `StateConfig's` `generate_state_config()` method
-impl ChainConfigDb for Database {
-    fn get_coin_config(&self) -> StorageResult<Option<Vec<CoinConfig>>> {
-        Self::get_coin_config(self).map_err(Into::into)
-    }
+impl<Description> Database<Description>
+where
+    Description: DatabaseDescription,
+{
+    pub fn rollback_last_block(&self) -> StorageResult<()> {
+        let mut lock = self.inner_storage().stage.height.lock();
+        let height = *lock;
 
-    fn get_contract_config(&self) -> StorageResult<Option<Vec<ContractConfig>>> {
-        Self::get_contract_config(self)
-    }
+        let Some(height) = height else {
+            return Err(
+                anyhow::anyhow!("Database doesn't have a height to rollback").into(),
+            );
+        };
+        self.inner_storage().data.rollback_block_to(&height)?;
+        let new_height = height.rollback_height();
+        *lock = new_height;
+        tracing::info!(
+            "Rollback of the {} to the height {:?} was successful",
+            Description::name(),
+            new_height
+        );
 
-    fn get_message_config(&self) -> StorageResult<Option<Vec<MessageConfig>>> {
-        Self::get_message_config(self).map_err(Into::into)
-    }
-
-    fn get_block_height(&self) -> StorageResult<BlockHeight> {
-        Self::latest_height(self)
+        Ok(())
     }
 }
 
+impl<Description> AtomicView for Database<Description>
+where
+    Description: DatabaseDescription,
+{
+    type LatestView = IterableKeyValueView<ColumnType<Description>>;
+
+    fn latest_view(&self) -> StorageResult<Self::LatestView> {
+        self.inner_storage().data.latest_view()
+    }
+}
+
+impl<Description> HistoricalView for Database<Description>
+where
+    Description: DatabaseDescription,
+{
+    type Height = Description::Height;
+    type ViewAtHeight = KeyValueView<ColumnType<Description>>;
+
+    fn latest_height(&self) -> Option<Self::Height> {
+        *self.inner_storage().stage.height.lock()
+    }
+
+    fn view_at(&self, height: &Self::Height) -> StorageResult<Self::ViewAtHeight> {
+        let lock = self.inner_storage().stage.height.lock();
+
+        match *lock {
+            None => return self.latest_view().map(|view| view.into_key_value_view()),
+            Some(current_height) if &current_height == height => {
+                return self.latest_view().map(|view| view.into_key_value_view())
+            }
+            _ => {}
+        };
+
+        self.inner_storage().data.view_at_height(height)
+    }
+}
+
+impl Modifiable for Database<OnChain> {
+    fn commit_changes(&mut self, changes: Changes) -> StorageResult<()> {
+        commit_changes_with_height_update(self, changes, |iter| {
+            iter.iter_all_keys::<FuelBlocks>(Some(IterDirection::Reverse))
+                .try_collect()
+        })
+    }
+}
+
+impl Modifiable for Database<OffChain> {
+    fn commit_changes(&mut self, changes: Changes) -> StorageResult<()> {
+        commit_changes_with_height_update(self, changes, |iter| {
+            iter.iter_all::<FuelBlockIdsToHeights>(Some(IterDirection::Reverse))
+                .map(|result| result.map(|(_, height)| height))
+                .try_collect()
+        })
+    }
+}
+
+impl Modifiable for Database<GasPriceDatabase> {
+    fn commit_changes(&mut self, changes: Changes) -> StorageResult<()> {
+        commit_changes_with_height_update(self, changes, |iter| {
+            iter.iter_all_keys::<GasPriceMetadata>(Some(IterDirection::Reverse))
+                .try_collect()
+        })
+    }
+}
+
+#[cfg(feature = "relayer")]
+impl Modifiable for Database<Relayer> {
+    fn commit_changes(&mut self, changes: Changes) -> StorageResult<()> {
+        commit_changes_with_height_update(self, changes, |iter| {
+            iter.iter_all_keys::<fuel_core_relayer::storage::EventsHistory>(Some(
+                IterDirection::Reverse,
+            ))
+            .try_collect()
+        })
+    }
+}
+
+#[cfg(not(feature = "relayer"))]
+impl Modifiable for Database<Relayer> {
+    fn commit_changes(&mut self, changes: Changes) -> StorageResult<()> {
+        commit_changes_with_height_update(self, changes, |_| Ok(vec![]))
+    }
+}
+
+impl Modifiable for GenesisDatabase<OnChain> {
+    fn commit_changes(&mut self, changes: Changes) -> StorageResult<()> {
+        self.data.as_ref().commit_changes(None, changes)
+    }
+}
+
+impl Modifiable for GenesisDatabase<OffChain> {
+    fn commit_changes(&mut self, changes: Changes) -> StorageResult<()> {
+        self.data.as_ref().commit_changes(None, changes)
+    }
+}
+
+impl Modifiable for GenesisDatabase<Relayer> {
+    fn commit_changes(&mut self, changes: Changes) -> StorageResult<()> {
+        self.data.as_ref().commit_changes(None, changes)
+    }
+}
+
+pub fn commit_changes_with_height_update<Description>(
+    database: &mut Database<Description>,
+    changes: Changes,
+    heights_lookup: impl Fn(
+        &ChangesIterator<Description::Column>,
+    ) -> StorageResult<Vec<Description::Height>>,
+) -> StorageResult<()>
+where
+    Description: DatabaseDescription,
+    Description::Height: Debug + PartialOrd + DatabaseHeight,
+    for<'a> StorageTransaction<&'a &'a mut Database<Description>>:
+        StorageMutate<MetadataTable<Description>, Error = StorageError>,
+{
+    // Gets the all new heights from the `changes`
+    let iterator = ChangesIterator::<Description::Column>::new(&changes);
+    let new_heights = heights_lookup(&iterator)?;
+
+    // Changes for each block should be committed separately.
+    // If we have more than one height, it means we are mixing commits
+    // for several heights in one batch - return error in this case.
+    if new_heights.len() > 1 {
+        return Err(DatabaseError::MultipleHeightsInCommit {
+            heights: new_heights.iter().map(DatabaseHeight::as_u64).collect(),
+        }
+        .into());
+    }
+
+    let new_height = new_heights.into_iter().last();
+    let prev_height = *database.stage.height.lock();
+
+    match (prev_height, new_height) {
+        (None, None) => {
+            // We are inside the regenesis process if the old and new heights are not set.
+            // In this case, we continue to commit until we discover a new height.
+            // This height will be the start of the database.
+        }
+        (Some(prev_height), Some(new_height)) => {
+            // Each new commit should be linked to the previous commit to create a monotonically growing database.
+
+            let next_expected_height = prev_height
+                .advance_height()
+                .ok_or(DatabaseError::FailedToAdvanceHeight)?;
+
+            if next_expected_height != new_height {
+                return Err(DatabaseError::HeightsAreNotLinked {
+                    prev_height: prev_height.as_u64(),
+                    new_height: new_height.as_u64(),
+                }
+                .into());
+            }
+        }
+        (None, Some(_)) => {
+            // The new height is finally found; starting at this point,
+            // all next commits should be linked(the height should increase each time by one).
+        }
+        (Some(prev_height), None) => {
+            // In production, we shouldn't have cases where we call `commit_changes` with intermediate changes.
+            // The commit always should contain all data for the corresponding height.
+            return Err(DatabaseError::NewHeightIsNotSet {
+                prev_height: prev_height.as_u64(),
+            }
+            .into());
+        }
+    };
+
+    let updated_changes = if let Some(new_height) = new_height {
+        // We want to update the metadata table to include a new height.
+        // For that, we are building a new storage transaction around `changes`.
+        // Modifying this transaction will include all required updates into the `changes`.
+        let mut transaction = StorageTransaction::transaction(
+            &database,
+            ConflictPolicy::Overwrite,
+            changes,
+        );
+        let maybe_current_metadata = transaction
+            .storage_as_mut::<MetadataTable<Description>>()
+            .get(&())?;
+        let metadata = update_metadata::<Description>(maybe_current_metadata, new_height);
+        transaction
+            .storage_as_mut::<MetadataTable<Description>>()
+            .insert(&(), &metadata)?;
+
+        transaction.into_changes()
+    } else {
+        changes
+    };
+
+    // Atomically commit the changes to the database, and to the mutex-protected field.
+    let mut guard = database.stage.height.lock();
+    database.data.commit_changes(new_height, updated_changes)?;
+
+    // Update the block height
+    if let Some(new_height) = new_height {
+        *guard = Some(new_height);
+    }
+
+    Ok(())
+}
+
+fn update_metadata<Description>(
+    maybe_current_metadata: Option<
+        Cow<DatabaseMetadata<<Description as DatabaseDescription>::Height>>,
+    >,
+    new_height: <Description as DatabaseDescription>::Height,
+) -> DatabaseMetadata<<Description as DatabaseDescription>::Height>
+where
+    Description: DatabaseDescription,
+{
+    let updated_metadata = match maybe_current_metadata.as_ref() {
+        Some(metadata) => match metadata.as_ref() {
+            DatabaseMetadata::V1 { .. } => DatabaseMetadata::V1 {
+                version: Description::version(),
+                height: new_height,
+            },
+            DatabaseMetadata::V2 {
+                indexation_availability,
+                ..
+            } => DatabaseMetadata::V2 {
+                version: Description::version(),
+                height: new_height,
+                indexation_availability: indexation_availability.clone(),
+            },
+        },
+        None => DatabaseMetadata::V2 {
+            version: Description::version(),
+            height: new_height,
+            indexation_availability: indexation_availability::<Description>(None),
+        },
+    };
+    updated_metadata
+}
+
 #[cfg(feature = "rocksdb")]
-pub fn convert_to_rocksdb_direction(
-    direction: fuel_core_storage::iter::IterDirection,
-) -> rocksdb::Direction {
+pub fn convert_to_rocksdb_direction(direction: IterDirection) -> rocksdb::Direction {
     match direction {
         IterDirection::Forward => rocksdb::Direction::Forward,
         IterDirection::Reverse => rocksdb::Direction::Reverse,
     }
 }
 
-#[test]
-fn column_keys_not_exceed_count() {
-    use enum_iterator::all;
-    for column in all::<Column>() {
-        assert!(column.as_usize() < Column::COUNT);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::{
+        database_description::DatabaseDescription,
+        Database,
+    };
+
+    fn column_keys_not_exceed_count<Description>()
+    where
+        Description: DatabaseDescription,
+    {
+        use enum_iterator::all;
+        use fuel_core_storage::kv_store::StorageColumn;
+        use strum::EnumCount;
+        for column in all::<Description::Column>() {
+            assert!(column.as_usize() < Description::Column::COUNT);
+        }
+    }
+
+    mod on_chain {
+        use super::*;
+        use crate::database::{
+            database_description::on_chain::OnChain,
+            DatabaseHeight,
+        };
+        use fuel_core_storage::{
+            tables::Coins,
+            transactional::WriteTransaction,
+        };
+        use fuel_core_types::{
+            blockchain::block::CompressedBlock,
+            entities::coins::coin::CompressedCoin,
+            fuel_tx::UtxoId,
+        };
+
+        #[test]
+        fn column_keys_not_exceed_count_test() {
+            column_keys_not_exceed_count::<OnChain>();
+        }
+
+        #[test]
+        fn database_advances_with_a_new_block() {
+            // Given
+            let mut database = Database::<OnChain>::default();
+            assert_eq!(database.latest_height(), None);
+
+            // When
+            let advanced_height = 1.into();
+            database
+                .storage_as_mut::<FuelBlocks>()
+                .insert(&advanced_height, &CompressedBlock::default())
+                .unwrap();
+
+            // Then
+            assert_eq!(database.latest_height(), Some(advanced_height));
+        }
+
+        #[test]
+        fn database_not_advances_without_block() {
+            // Given
+            let mut database = Database::<OnChain>::default();
+            assert_eq!(database.latest_height(), None);
+
+            // When
+            database
+                .storage_as_mut::<Coins>()
+                .insert(&UtxoId::default(), &CompressedCoin::default())
+                .unwrap();
+
+            // Then
+            assert_eq!(HistoricalView::latest_height(&database), None);
+        }
+
+        #[test]
+        fn database_advances_with_linked_blocks() {
+            // Given
+            let mut database = Database::<OnChain>::default();
+            let starting_height = 1.into();
+            database
+                .storage_as_mut::<FuelBlocks>()
+                .insert(&starting_height, &CompressedBlock::default())
+                .unwrap();
+            assert_eq!(database.latest_height(), Some(starting_height));
+
+            // When
+            let next_height = starting_height.advance_height().unwrap();
+            database
+                .storage_as_mut::<FuelBlocks>()
+                .insert(&next_height, &CompressedBlock::default())
+                .unwrap();
+
+            // Then
+            assert_eq!(database.latest_height(), Some(next_height));
+        }
+
+        #[test]
+        fn database_fails_with_unlinked_blocks() {
+            // Given
+            let mut database = Database::<OnChain>::default();
+            let starting_height = 1.into();
+            database
+                .storage_as_mut::<FuelBlocks>()
+                .insert(&starting_height, &CompressedBlock::default())
+                .unwrap();
+
+            // When
+            let prev_height = 0.into();
+            let result = database
+                .storage_as_mut::<FuelBlocks>()
+                .insert(&prev_height, &CompressedBlock::default());
+
+            // Then
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                StorageError::from(DatabaseError::HeightsAreNotLinked {
+                    prev_height: 1,
+                    new_height: 0
+                })
+                .to_string()
+            );
+        }
+
+        #[test]
+        fn database_fails_with_non_advancing_commit() {
+            // Given
+            let mut database = Database::<OnChain>::default();
+            let starting_height = 1.into();
+            database
+                .storage_as_mut::<FuelBlocks>()
+                .insert(&starting_height, &CompressedBlock::default())
+                .unwrap();
+
+            // When
+            let result = database
+                .storage_as_mut::<Coins>()
+                .insert(&UtxoId::default(), &CompressedCoin::default());
+
+            // Then
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                StorageError::from(DatabaseError::NewHeightIsNotSet { prev_height: 1 })
+                    .to_string()
+            );
+        }
+
+        #[test]
+        fn database_fails_when_commit_with_several_blocks() {
+            let mut database = Database::<OnChain>::default();
+            let starting_height = 1.into();
+            database
+                .storage_as_mut::<FuelBlocks>()
+                .insert(&starting_height, &CompressedBlock::default())
+                .unwrap();
+
+            // Given
+            let mut transaction = database.write_transaction();
+            let next_height = starting_height.advance_height().unwrap();
+            let next_next_height = next_height.advance_height().unwrap();
+            transaction
+                .storage_as_mut::<FuelBlocks>()
+                .insert(&next_height, &CompressedBlock::default())
+                .unwrap();
+            transaction
+                .storage_as_mut::<FuelBlocks>()
+                .insert(&next_next_height, &CompressedBlock::default())
+                .unwrap();
+
+            // When
+            let result = transaction.commit();
+
+            // Then
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                StorageError::from(DatabaseError::MultipleHeightsInCommit {
+                    heights: vec![3, 2]
+                })
+                .to_string()
+            );
+        }
+    }
+
+    mod off_chain {
+        use super::*;
+        use crate::{
+            database::{
+                database_description::off_chain::OffChain,
+                DatabaseHeight,
+            },
+            fuel_core_graphql_api::storage::messages::OwnedMessageKey,
+            graphql_api::storage::messages::OwnedMessageIds,
+        };
+        use fuel_core_storage::transactional::WriteTransaction;
+
+        #[test]
+        fn column_keys_not_exceed_count_test() {
+            column_keys_not_exceed_count::<OffChain>();
+        }
+
+        #[test]
+        fn database_advances_with_a_new_block() {
+            // Given
+            let mut database = Database::<OffChain>::default();
+            assert_eq!(database.latest_height(), None);
+
+            // When
+            let advanced_height = 1.into();
+            database
+                .storage_as_mut::<FuelBlockIdsToHeights>()
+                .insert(&Default::default(), &advanced_height)
+                .unwrap();
+
+            // Then
+            assert_eq!(database.latest_height(), Some(advanced_height));
+        }
+
+        #[test]
+        fn database_not_advances_without_block() {
+            // Given
+            let mut database = Database::<OffChain>::default();
+            assert_eq!(database.latest_height(), None);
+
+            // When
+            database
+                .storage_as_mut::<OwnedMessageIds>()
+                .insert(&OwnedMessageKey::default(), &())
+                .unwrap();
+
+            // Then
+            assert_eq!(HistoricalView::latest_height(&database), None);
+        }
+
+        #[test]
+        fn database_advances_with_linked_blocks() {
+            // Given
+            let mut database = Database::<OffChain>::default();
+            let starting_height = 1.into();
+            database
+                .storage_as_mut::<FuelBlockIdsToHeights>()
+                .insert(&Default::default(), &starting_height)
+                .unwrap();
+            assert_eq!(database.latest_height(), Some(starting_height));
+
+            // When
+            let next_height = starting_height.advance_height().unwrap();
+            database
+                .storage_as_mut::<FuelBlockIdsToHeights>()
+                .insert(&Default::default(), &next_height)
+                .unwrap();
+
+            // Then
+            assert_eq!(database.latest_height(), Some(next_height));
+        }
+
+        #[test]
+        fn database_fails_with_unlinked_blocks() {
+            // Given
+            let mut database = Database::<OffChain>::default();
+            let starting_height = 1.into();
+            database
+                .storage_as_mut::<FuelBlockIdsToHeights>()
+                .insert(&Default::default(), &starting_height)
+                .unwrap();
+
+            // When
+            let prev_height = 0.into();
+            let result = database
+                .storage_as_mut::<FuelBlockIdsToHeights>()
+                .insert(&Default::default(), &prev_height);
+
+            // Then
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                StorageError::from(DatabaseError::HeightsAreNotLinked {
+                    prev_height: 1,
+                    new_height: 0
+                })
+                .to_string()
+            );
+        }
+
+        #[test]
+        fn database_fails_with_non_advancing_commit() {
+            // Given
+            let mut database = Database::<OffChain>::default();
+            let starting_height = 1.into();
+            database
+                .storage_as_mut::<FuelBlockIdsToHeights>()
+                .insert(&Default::default(), &starting_height)
+                .unwrap();
+
+            // When
+            let result = database
+                .storage_as_mut::<OwnedMessageIds>()
+                .insert(&OwnedMessageKey::default(), &());
+
+            // Then
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                StorageError::from(DatabaseError::NewHeightIsNotSet { prev_height: 1 })
+                    .to_string()
+            );
+        }
+
+        #[test]
+        fn database_fails_when_commit_with_several_blocks() {
+            let mut database = Database::<OffChain>::default();
+            let starting_height = 1.into();
+            database
+                .storage_as_mut::<FuelBlockIdsToHeights>()
+                .insert(&Default::default(), &starting_height)
+                .unwrap();
+
+            // Given
+            let mut transaction = database.write_transaction();
+            let next_height = starting_height.advance_height().unwrap();
+            let next_next_height = next_height.advance_height().unwrap();
+            transaction
+                .storage_as_mut::<FuelBlockIdsToHeights>()
+                .insert(&[1; 32].into(), &next_height)
+                .unwrap();
+            transaction
+                .storage_as_mut::<FuelBlockIdsToHeights>()
+                .insert(&[2; 32].into(), &next_next_height)
+                .unwrap();
+
+            // When
+            let result = transaction.commit();
+
+            // Then
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                StorageError::from(DatabaseError::MultipleHeightsInCommit {
+                    heights: vec![3, 2]
+                })
+                .to_string()
+            );
+        }
+    }
+
+    #[cfg(feature = "relayer")]
+    mod relayer {
+        use super::*;
+        use crate::database::{
+            database_description::relayer::Relayer,
+            DatabaseHeight,
+        };
+        use fuel_core_relayer::storage::EventsHistory;
+        use fuel_core_storage::transactional::WriteTransaction;
+        use fuel_core_types::blockchain::primitives::DaBlockHeight;
+
+        #[test]
+        fn column_keys_not_exceed_count_test() {
+            column_keys_not_exceed_count::<Relayer>();
+        }
+
+        #[test]
+        fn database_advances_with_a_new_block() {
+            // Given
+            let mut database = Database::<Relayer>::default();
+            assert_eq!(database.latest_height(), None);
+
+            // When
+            let advanced_height = 1u64.into();
+            database
+                .storage_as_mut::<EventsHistory>()
+                .insert(&advanced_height, &[])
+                .unwrap();
+
+            // Then
+            assert_eq!(database.latest_height(), Some(advanced_height));
+        }
+
+        #[test]
+        fn database_not_advances_without_block() {
+            // Given
+            let mut database = Database::<Relayer>::default();
+            assert_eq!(database.latest_height(), None);
+
+            // When
+            database
+                .storage_as_mut::<MetadataTable<Relayer>>()
+                .insert(
+                    &(),
+                    &DatabaseMetadata::<DaBlockHeight>::V1 {
+                        version: Default::default(),
+                        height: Default::default(),
+                    },
+                )
+                .unwrap();
+
+            // Then
+            assert_eq!(HistoricalView::latest_height(&database), None);
+        }
+
+        #[test]
+        fn database_advances_with_linked_blocks() {
+            // Given
+            let mut database = Database::<Relayer>::default();
+            let starting_height = 1u64.into();
+            database
+                .storage_as_mut::<EventsHistory>()
+                .insert(&starting_height, &[])
+                .unwrap();
+            assert_eq!(database.latest_height(), Some(starting_height));
+
+            // When
+            let next_height = starting_height.advance_height().unwrap();
+            database
+                .storage_as_mut::<EventsHistory>()
+                .insert(&next_height, &[])
+                .unwrap();
+
+            // Then
+            assert_eq!(database.latest_height(), Some(next_height));
+        }
+
+        #[test]
+        fn database_fails_with_unlinked_blocks() {
+            // Given
+            let mut database = Database::<Relayer>::default();
+            let starting_height = 1u64.into();
+            database
+                .storage_as_mut::<EventsHistory>()
+                .insert(&starting_height, &[])
+                .unwrap();
+
+            // When
+            let prev_height = 0u64.into();
+            let result = database
+                .storage_as_mut::<EventsHistory>()
+                .insert(&prev_height, &[]);
+
+            // Then
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                StorageError::from(DatabaseError::HeightsAreNotLinked {
+                    prev_height: 1,
+                    new_height: 0
+                })
+                .to_string()
+            );
+        }
+
+        #[test]
+        fn database_fails_with_non_advancing_commit() {
+            // Given
+            let mut database = Database::<Relayer>::default();
+            let starting_height = 1u64.into();
+            database
+                .storage_as_mut::<EventsHistory>()
+                .insert(&starting_height, &[])
+                .unwrap();
+
+            // When
+            let result = database.storage_as_mut::<MetadataTable<Relayer>>().insert(
+                &(),
+                &DatabaseMetadata::<DaBlockHeight>::V1 {
+                    version: Default::default(),
+                    height: Default::default(),
+                },
+            );
+
+            // Then
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                StorageError::from(DatabaseError::NewHeightIsNotSet { prev_height: 1 })
+                    .to_string()
+            );
+        }
+
+        #[test]
+        fn database_fails_when_commit_with_several_blocks() {
+            let mut database = Database::<Relayer>::default();
+            let starting_height = 1u64.into();
+            database
+                .storage_as_mut::<EventsHistory>()
+                .insert(&starting_height, &[])
+                .unwrap();
+
+            // Given
+            let mut transaction = database.write_transaction();
+            let next_height = starting_height.advance_height().unwrap();
+            let next_next_height = next_height.advance_height().unwrap();
+            transaction
+                .storage_as_mut::<EventsHistory>()
+                .insert(&next_height, &[])
+                .unwrap();
+            transaction
+                .storage_as_mut::<EventsHistory>()
+                .insert(&next_next_height, &[])
+                .unwrap();
+
+            // When
+            let result = transaction.commit();
+
+            // Then
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                StorageError::from(DatabaseError::MultipleHeightsInCommit {
+                    heights: vec![3, 2]
+                })
+                .to_string()
+            );
+        }
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn database_iter_all_by_prefix_works() {
+        use fuel_core_storage::tables::ContractsRawCode;
+        use fuel_core_types::fuel_types::ContractId;
+        use std::str::FromStr;
+
+        let test = |mut db: Database<OnChain>| {
+            let contract_id_1 = ContractId::from_str(
+                "5962be5ebddc516cb4ed7d7e76365f59e0d231ac25b53f262119edf76564aab4",
+            )
+            .unwrap();
+
+            let mut insert_empty_code = |id| {
+                StorageMutate::<ContractsRawCode>::insert(&mut db, &id, &[]).unwrap()
+            };
+            insert_empty_code(contract_id_1);
+
+            let contract_id_2 = ContractId::from_str(
+                "5baf0dcae7c114f647f6e71f1723f59bcfc14ecb28071e74895d97b14873c5dc",
+            )
+            .unwrap();
+            insert_empty_code(contract_id_2);
+
+            let matched_keys: Vec<_> = db
+                .iter_all_by_prefix::<ContractsRawCode, _>(Some(contract_id_1))
+                .map_ok(|(k, _)| k)
+                .try_collect()
+                .unwrap();
+
+            assert_eq!(matched_keys, vec![contract_id_1]);
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Database::<OnChain>::in_memory();
+        // in memory passes
+        test(db);
+
+        let db = Database::<OnChain>::open_rocksdb(
+            temp_dir.path(),
+            Default::default(),
+            DatabaseConfig::config_for_tests(),
+        )
+        .unwrap();
+        // rocks db fails
+        test(db);
+    }
+
+    mod metadata {
+        use crate::database::database_description::IndexationKind;
+        use fuel_core_storage::kv_store::StorageColumn;
+        use std::{
+            borrow::Cow,
+            collections::HashSet,
+        };
+        use strum::EnumCount;
+
+        use super::{
+            database_description::DatabaseDescription,
+            update_metadata,
+            DatabaseHeight,
+            DatabaseMetadata,
+        };
+
+        #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+        struct HeightMock(u64);
+        impl DatabaseHeight for HeightMock {
+            fn as_u64(&self) -> u64 {
+                1
+            }
+
+            fn advance_height(&self) -> Option<Self> {
+                None
+            }
+
+            fn rollback_height(&self) -> Option<Self> {
+                None
+            }
+        }
+
+        const MOCK_VERSION: u32 = 0;
+
+        #[derive(EnumCount, enum_iterator::Sequence, Debug, Clone, Copy)]
+        enum ColumnMock {
+            Column1,
+        }
+
+        impl StorageColumn for ColumnMock {
+            fn name(&self) -> String {
+                "column".to_string()
+            }
+
+            fn id(&self) -> u32 {
+                42
+            }
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        struct DatabaseDescriptionMock;
+        impl DatabaseDescription for DatabaseDescriptionMock {
+            type Column = ColumnMock;
+
+            type Height = HeightMock;
+
+            fn version() -> u32 {
+                MOCK_VERSION
+            }
+
+            fn name() -> String {
+                "mock".to_string()
+            }
+
+            fn metadata_column() -> Self::Column {
+                Self::Column::Column1
+            }
+
+            fn prefix(_: &Self::Column) -> Option<usize> {
+                None
+            }
+        }
+
+        #[test]
+        fn update_metadata_preserves_v1() {
+            let current_metadata: DatabaseMetadata<HeightMock> = DatabaseMetadata::V1 {
+                version: MOCK_VERSION,
+                height: HeightMock(1),
+            };
+            let new_metadata = update_metadata::<DatabaseDescriptionMock>(
+                Some(Cow::Borrowed(&current_metadata)),
+                HeightMock(2),
+            );
+
+            match new_metadata {
+                DatabaseMetadata::V1 { version, height } => {
+                    assert_eq!(version, current_metadata.version());
+                    assert_eq!(height, HeightMock(2));
+                }
+                DatabaseMetadata::V2 { .. } => panic!("should be V1"),
+            }
+        }
+
+        #[test]
+        fn update_metadata_preserves_v2() {
+            let available_indexation = HashSet::new();
+
+            let current_metadata: DatabaseMetadata<HeightMock> = DatabaseMetadata::V2 {
+                version: MOCK_VERSION,
+                height: HeightMock(1),
+                indexation_availability: available_indexation.clone(),
+            };
+            let new_metadata = update_metadata::<DatabaseDescriptionMock>(
+                Some(Cow::Borrowed(&current_metadata)),
+                HeightMock(2),
+            );
+
+            match new_metadata {
+                DatabaseMetadata::V1 { .. } => panic!("should be V2"),
+                DatabaseMetadata::V2 {
+                    version,
+                    height,
+                    indexation_availability,
+                } => {
+                    assert_eq!(version, current_metadata.version());
+                    assert_eq!(height, HeightMock(2));
+                    assert_eq!(indexation_availability, available_indexation);
+                }
+            }
+        }
+
+        #[test]
+        fn update_metadata_none_becomes_v2() {
+            let new_metadata =
+                update_metadata::<DatabaseDescriptionMock>(None, HeightMock(2));
+
+            match new_metadata {
+                DatabaseMetadata::V1 { .. } => panic!("should be V2"),
+                DatabaseMetadata::V2 {
+                    version,
+                    height,
+                    indexation_availability,
+                } => {
+                    assert_eq!(version, MOCK_VERSION);
+                    assert_eq!(height, HeightMock(2));
+                    assert_eq!(indexation_availability, IndexationKind::all().collect());
+                }
+            }
+        }
     }
 }

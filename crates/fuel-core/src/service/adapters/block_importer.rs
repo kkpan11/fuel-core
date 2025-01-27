@@ -9,50 +9,64 @@ use crate::{
 use fuel_core_importer::{
     ports::{
         BlockVerifier,
-        Executor,
-        ExecutorDatabase,
         ImporterDatabase,
+        Validator,
     },
     Config,
     Importer,
 };
-use fuel_core_poa::ports::RelayerPort;
 use fuel_core_storage::{
-    tables::SealedBlockConsensus,
-    transactional::StorageTransaction,
+    iter::{
+        IterDirection,
+        IteratorOverTable,
+    },
+    tables::{
+        merkle::{
+            DenseMetadataKey,
+            FuelBlockMerkleMetadata,
+        },
+        FuelBlocks,
+    },
+    transactional::Changes,
+    MerkleRoot,
     Result as StorageResult,
-    StorageAsMut,
+    StorageAsRef,
+};
+use fuel_core_txpool::ports::{
+    WasmChecker,
+    WasmValidityError,
 };
 use fuel_core_types::{
     blockchain::{
         block::Block,
         consensus::Consensus,
-        primitives::{
-            BlockId,
-            DaBlockHeight,
-        },
         SealedBlock,
     },
-    fuel_types::BlockHeight,
+    fuel_tx::Bytes32,
+    fuel_types::{
+        BlockHeight,
+        ChainId,
+    },
     services::executor::{
-        ExecutionTypes,
         Result as ExecutorResult,
-        UncommittedResult as UncommittedExecutionResult,
+        UncommittedValidationResult,
     },
 };
 use std::sync::Arc;
 
-use super::MaybeRelayerAdapter;
-
 impl BlockImporterAdapter {
     pub fn new(
+        chain_id: ChainId,
         config: Config,
         database: Database,
         executor: ExecutorAdapter,
         verifier: VerifierAdapter,
     ) -> Self {
-        let importer = Importer::new(config, database, executor, verifier);
-        importer.init_metrics();
+        let metrics = config.metrics;
+        let importer = Importer::new(chain_id, config, database, executor, verifier);
+        if metrics {
+            importer.init_metrics();
+        }
         Self {
             block_importer: Arc::new(importer),
         }
@@ -62,11 +76,7 @@ impl BlockImporterAdapter {
         &self,
         sealed_block: SealedBlock,
     ) -> anyhow::Result<()> {
-        tokio::task::spawn_blocking({
-            let importer = self.block_importer.clone();
-            move || importer.execute_and_commit(sealed_block)
-        })
-        .await??;
+        self.block_importer.execute_and_commit(sealed_block).await?;
         Ok(())
     }
 }
@@ -81,66 +91,53 @@ impl BlockVerifier for VerifierAdapter {
     }
 }
 
-#[async_trait::async_trait]
-impl RelayerPort for MaybeRelayerAdapter {
-    async fn await_until_if_in_range(
-        &self,
-        da_height: &DaBlockHeight,
-        _max_da_lag: &DaBlockHeight,
-    ) -> anyhow::Result<()> {
-        #[cfg(feature = "relayer")]
-        {
-            if let Some(sync) = self.relayer_synced.as_ref() {
-                let current_height = sync.get_finalized_da_height()?;
-                anyhow::ensure!(
-                    da_height.saturating_sub(*current_height) <= **_max_da_lag,
-                    "Relayer is too far out of sync"
-                );
-                sync.await_at_least_synced(da_height).await?;
-            }
-            Ok(())
-        }
-        #[cfg(not(feature = "relayer"))]
-        {
-            anyhow::ensure!(
-                **da_height == 0,
-                "Cannot have a da height above zero without a relayer"
-            );
-            Ok(())
-        }
-    }
-}
-
 impl ImporterDatabase for Database {
-    fn latest_block_height(&self) -> StorageResult<BlockHeight> {
-        self.latest_height()
+    fn latest_block_height(&self) -> StorageResult<Option<BlockHeight>> {
+        self.iter_all_keys::<FuelBlocks>(Some(IterDirection::Reverse))
+            .next()
+            .transpose()
     }
 
-    fn increase_tx_count(&self, new_txs_count: u64) -> StorageResult<u64> {
-        self.increase_tx_count(new_txs_count).map_err(Into::into)
-    }
-}
-
-impl ExecutorDatabase for Database {
-    fn seal_block(
-        &mut self,
-        block_id: &BlockId,
-        consensus: &Consensus,
-    ) -> StorageResult<Option<Consensus>> {
-        self.storage::<SealedBlockConsensus>()
-            .insert(block_id, consensus)
-            .map_err(Into::into)
+    fn latest_block_root(&self) -> StorageResult<Option<MerkleRoot>> {
+        Ok(self
+            .storage_as_ref::<FuelBlockMerkleMetadata>()
+            .get(&DenseMetadataKey::Latest)?
+            .map(|cow| *cow.root()))
     }
 }
 
-impl Executor for ExecutorAdapter {
-    type Database = Database;
-
-    fn execute_without_commit(
+impl Validator for ExecutorAdapter {
+    fn validate(
         &self,
-        block: Block,
-    ) -> ExecutorResult<UncommittedExecutionResult<StorageTransaction<Self::Database>>>
-    {
-        self._execute_without_commit(ExecutionTypes::Validation(block))
+        block: &Block,
+    ) -> ExecutorResult<UncommittedValidationResult<Changes>> {
+        self.executor.validate(block)
+    }
+}
+
+#[cfg(feature = "wasm-executor")]
+impl WasmChecker for ExecutorAdapter {
+    fn validate_uploaded_wasm(
+        &self,
+        wasm_root: &Bytes32,
+    ) -> Result<(), WasmValidityError> {
+        self.executor
+            .validate_uploaded_wasm(wasm_root)
+            .map_err(|err| match err {
+                fuel_core_upgradable_executor::error::UpgradableError::InvalidWasm(_) => {
+                    WasmValidityError::NotValid
+                }
+                _ => WasmValidityError::NotFound,
+            })
+    }
+}
+
+#[cfg(not(feature = "wasm-executor"))]
+impl WasmChecker for ExecutorAdapter {
+    fn validate_uploaded_wasm(
+        &self,
+        _wasm_root: &Bytes32,
+    ) -> Result<(), WasmValidityError> {
+        Err(WasmValidityError::NotEnabled)
     }
 }

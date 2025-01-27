@@ -4,6 +4,7 @@ use crate::helpers::{
     TestContext,
     TestSetupBuilder,
 };
+use fuel_core_poa::Trigger;
 use fuel_core_types::{
     fuel_asm::*,
     fuel_crypto::*,
@@ -16,17 +17,13 @@ use rand::{
     Rng,
     SeedableRng,
 };
-use std::{
-    sync::Arc,
-    time::Duration,
-};
 
 #[tokio::test]
-async fn txs_max_gas_limit() {
-    const MAX_GAS_LIMIT: u64 = 50_000_000;
+async fn txs_max_script_gas_limit() {
+    const MAX_GAS_LIMIT: u64 = 5_000_000_000;
     let mut rng = StdRng::seed_from_u64(2322);
     let mut test_builder = TestSetupBuilder::new(2322);
-    test_builder.gas_limit = MAX_GAS_LIMIT;
+    test_builder.gas_limit = Some(MAX_GAS_LIMIT);
     // initialize 10 random transactions that transfer coins
     let transactions = (1..=10)
         .map(|i| {
@@ -34,13 +31,11 @@ async fn txs_max_gas_limit() {
                 op::ret(RegId::ONE).to_bytes().into_iter().collect(),
                 vec![],
             )
-            .gas_limit(MAX_GAS_LIMIT / 2)
-            .gas_price(1)
+            .script_gas_limit(MAX_GAS_LIMIT / 2)
             .add_unsigned_coin_input(
                 SecretKey::random(&mut rng),
                 rng.gen(),
                 1000 + i,
-                Default::default(),
                 Default::default(),
                 Default::default(),
             )
@@ -55,6 +50,7 @@ async fn txs_max_gas_limit() {
 
     // setup genesis block with coins that transactions can spend
     test_builder.config_coin_inputs_from_transactions(&transactions.iter().collect_vec());
+    test_builder.trigger = Trigger::Never;
 
     // spin up node
     let TestContext { client, srv, .. } = test_builder.finalize().await;
@@ -63,13 +59,14 @@ async fn txs_max_gas_limit() {
     let txs = transactions
         .clone()
         .into_iter()
-        .map(|script| Arc::new(fuel_tx::Transaction::from(script)))
+        .map(fuel_tx::Transaction::from)
         .collect::<Vec<_>>();
-    srv.shared.txpool.insert(txs).await;
+    for tx in txs {
+        srv.shared.txpool_shared_state.insert(tx).await.unwrap();
+    }
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let block = client.block_by_height(1).await.unwrap().unwrap();
+    client.produce_blocks(1, None).await.unwrap();
+    let block = client.block_by_height(1.into()).await.unwrap().unwrap();
     assert_eq!(
         block.transactions.len(),
         transactions.len() + 1 // coinbase

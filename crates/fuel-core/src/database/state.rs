@@ -1,199 +1,113 @@
-use crate::database::{
-    storage::{
-        ContractsStateMerkleData,
-        ContractsStateMerkleMetadata,
-        DatabaseColumn,
-        SparseMerkleMetadata,
-    },
-    Column,
-    Database,
-};
+use fuel_core_chain_config::TableEntry;
 use fuel_core_storage::{
-    tables::ContractsState,
+    tables::{
+        merkle::ContractsStateMerkleMetadata,
+        ContractsState,
+    },
     ContractsStateKey,
     Error as StorageError,
-    Mappable,
-    MerkleRoot,
-    MerkleRootStorage,
-    StorageAsMut,
     StorageAsRef,
+    StorageBatchMutate,
     StorageInspect,
-    StorageMutate,
 };
-use fuel_core_types::{
-    fuel_merkle::{
-        sparse,
-        sparse::{
-            in_memory,
-            MerkleTree,
-            MerkleTreeKey,
-        },
-    },
-    fuel_types::{
-        Bytes32,
-        ContractId,
-    },
+use fuel_core_types::fuel_types::{
+    Bytes32,
+    ContractId,
 };
 use itertools::Itertools;
-use std::{
-    borrow::{
-        BorrowMut,
-        Cow,
-    },
-    ops::Deref,
-};
 
-impl StorageInspect<ContractsState> for Database {
-    type Error = StorageError;
-
-    fn get(
-        &self,
-        key: &<ContractsState as Mappable>::Key,
-    ) -> Result<Option<Cow<<ContractsState as Mappable>::OwnedValue>>, Self::Error> {
-        self.get(key.as_ref(), Column::ContractsState)
-            .map_err(Into::into)
-    }
-
-    fn contains_key(
-        &self,
-        key: &<ContractsState as Mappable>::Key,
-    ) -> Result<bool, Self::Error> {
-        self.contains_key(key.as_ref(), Column::ContractsState)
-            .map_err(Into::into)
-    }
-}
-
-impl StorageMutate<ContractsState> for Database {
-    fn insert(
-        &mut self,
-        key: &<ContractsState as Mappable>::Key,
-        value: &<ContractsState as Mappable>::Value,
-    ) -> Result<Option<<ContractsState as Mappable>::OwnedValue>, Self::Error> {
-        let prev = Database::insert(self, key.as_ref(), Column::ContractsState, value)
-            .map_err(Into::into);
-
-        // Get latest metadata entry for this contract id
-        let prev_metadata = self
-            .storage::<ContractsStateMerkleMetadata>()
-            .get(key.contract_id())?
-            .unwrap_or_default();
-
-        let root = prev_metadata.root;
-        let storage = self.borrow_mut();
-        let mut tree: MerkleTree<ContractsStateMerkleData, _> =
-            MerkleTree::load(storage, &root)
-                .map_err(|err| StorageError::Other(anyhow::anyhow!("{err:?}")))?;
-
-        let state_key = *key.state_key().deref();
-        // Update the contract's key-value dataset. The key is the state key and
-        // the value is the 32 bytes
-        tree.update(MerkleTreeKey::new(state_key), value.as_slice())
-            .map_err(|err| StorageError::Other(anyhow::anyhow!("{err:?}")))?;
-
-        // Generate new metadata for the updated tree
-        let root = tree.root();
-        let metadata = SparseMerkleMetadata { root };
-        self.storage::<ContractsStateMerkleMetadata>()
-            .insert(key.contract_id(), &metadata)?;
-
-        prev
-    }
-
-    fn remove(
-        &mut self,
-        key: &<ContractsState as Mappable>::Key,
-    ) -> Result<Option<<ContractsState as Mappable>::OwnedValue>, Self::Error> {
-        let prev = Database::remove(self, key.as_ref(), Column::ContractsState)
-            .map_err(Into::into);
-
-        // Get latest metadata entry for this contract id
-        let prev_metadata = self
-            .storage::<ContractsStateMerkleMetadata>()
-            .get(key.contract_id())?;
-
-        if let Some(prev_metadata) = prev_metadata {
-            let root = prev_metadata.root;
-
-            // Load the tree saved in metadata
-            let storage = self.borrow_mut();
-            let mut tree: MerkleTree<ContractsStateMerkleData, _> =
-                MerkleTree::load(storage, &root)
-                    .map_err(|err| StorageError::Other(anyhow::anyhow!("{err:?}")))?;
-
-            let state_key = *key.state_key().deref();
-            // Update the contract's key-value dataset. The key is the state key and
-            // the value is the 32 bytes
-            tree.delete(MerkleTreeKey::new(state_key))
-                .map_err(|err| StorageError::Other(anyhow::anyhow!("{err:?}")))?;
-
-            let root = tree.root();
-            if root == *sparse::empty_sum() {
-                // The tree is now empty; remove the metadata
-                self.storage::<ContractsStateMerkleMetadata>()
-                    .remove(key.contract_id())?;
-            } else {
-                // Generate new metadata for the updated tree
-                let metadata = SparseMerkleMetadata { root };
-                self.storage::<ContractsStateMerkleMetadata>()
-                    .insert(key.contract_id(), &metadata)?;
-            }
-        }
-
-        prev
-    }
-}
-
-impl MerkleRootStorage<ContractId, ContractsState> for Database {
-    fn root(&self, parent: &ContractId) -> Result<MerkleRoot, Self::Error> {
-        let metadata = self.storage::<ContractsStateMerkleMetadata>().get(parent)?;
-        let root = metadata
-            .map(|metadata| metadata.root)
-            .unwrap_or_else(|| in_memory::MerkleTree::new().root());
-        Ok(root)
-    }
-}
-
-impl Database {
+pub trait StateInitializer {
     /// Initialize the state of the contract from all leaves.
     /// This method is more performant than inserting state one by one.
-    pub fn init_contract_state<S>(
+    fn init_contract_state<S>(
         &mut self,
         contract_id: &ContractId,
         slots: S,
     ) -> Result<(), StorageError>
     where
-        S: Iterator<Item = (Bytes32, Bytes32)>,
+        S: Iterator<Item = (Bytes32, Vec<u8>)>;
+
+    /// Updates the state of multiple contracts based on provided state slots.
+    fn update_contract_states(
+        &mut self,
+        states: impl IntoIterator<Item = TableEntry<ContractsState>>,
+    ) -> Result<(), StorageError>;
+}
+
+impl<S> StateInitializer for S
+where
+    S: StorageInspect<ContractsStateMerkleMetadata, Error = StorageError>,
+    S: StorageBatchMutate<ContractsState, Error = StorageError>,
+{
+    fn init_contract_state<I>(
+        &mut self,
+        contract_id: &ContractId,
+        slots: I,
+    ) -> Result<(), StorageError>
+    where
+        I: Iterator<Item = (Bytes32, Vec<u8>)>,
     {
-        if self
-            .storage::<ContractsStateMerkleMetadata>()
-            .contains_key(contract_id)?
-        {
-            return Err(anyhow::anyhow!("The contract state is already initialized").into())
-        }
-
-        let slots = slots.collect_vec();
-
-        // Keys and values should be original without any modifications.
-        // Key is `ContractId` ++ `StorageKey`
-        self.batch_insert(
-            Column::ContractsState,
-            slots
-                .clone()
-                .into_iter()
-                .map(|(key, value)| (ContractsStateKey::new(contract_id, &key), value)),
-        )?;
-
-        // Merkle data:
-        // - State key should be converted into `MerkleTreeKey` by `new` function that hashes them.
-        // - The state value are original.
         let slots = slots
+            .map(|(key, value)| (ContractsStateKey::new(contract_id, &key), value))
+            .collect_vec();
+        <_ as StorageBatchMutate<ContractsState>>::init_storage(
+            self,
+            &mut slots.iter().map(|(key, value)| (key, value.as_slice())),
+        )
+    }
+
+    /// Updates the state of multiple contracts based on provided state slots.
+    ///
+    /// Grouping: Adjacent state entries sharing the same contract ID are grouped together.
+    ///           This ensures that consecutive entries for the same contract are processed as a single batch.
+    ///
+    /// State Update Process:
+    ///    - All state entries are inserted into the database.
+    ///    - For new contracts (i.e., those without a previously recorded state), the group is
+    ///      first sorted before the state root is calculated. This is a consequence of the
+    ///      batch-insertion logic of MerkleTree::from_set.
+    ///    - For contracts with an existing state, the function updates their state merkle tree
+    ///      calling MerkleTree::update for each state entry in the group in-order.
+    ///
+    /// # Errors
+    /// On any error while accessing the database.
+    fn update_contract_states(
+        &mut self,
+        states: impl IntoIterator<Item = TableEntry<ContractsState>>,
+    ) -> Result<(), StorageError> {
+        states
             .into_iter()
-            .map(|(key, value)| (MerkleTreeKey::new(key), value));
-        let (root, nodes) = in_memory::MerkleTree::nodes_from_set(slots);
-        self.batch_insert(ContractsStateMerkleData::column(), nodes.into_iter())?;
-        let metadata = SparseMerkleMetadata { root };
-        self.storage::<ContractsStateMerkleMetadata>()
-            .insert(contract_id, &metadata)?;
+            .group_by(|s| *s.key.contract_id())
+            .into_iter()
+            .try_for_each(|(contract_id, entries)| {
+                if self
+                    .storage::<ContractsStateMerkleMetadata>()
+                    .get(&contract_id)?
+                    .is_some()
+                {
+                    // TODO: this collecting is unfortunate. We should try to avoid it.
+                    let state_entries = entries
+                        .into_iter()
+                        .map(|state_entry| {
+                            (state_entry.key, Vec::<u8>::from(state_entry.value))
+                        })
+                        .collect_vec();
+
+                    <_ as StorageBatchMutate<ContractsState>>::insert_batch(
+                        self,
+                        state_entries
+                            .iter()
+                            .map(|entry| (&entry.0, entry.1.as_slice())),
+                    )
+                } else {
+                    self.init_contract_state(
+                        &contract_id,
+                        entries
+                            .into_iter()
+                            .map(|e| (*e.key.state_key(), e.value.into())),
+                    )
+                }
+            })?;
 
         Ok(())
     }
@@ -202,9 +116,13 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::{
+        database_description::on_chain::OnChain,
+        Database,
+    };
     use fuel_core_storage::{
+        transactional::IntoTransaction,
         StorageAsMut,
-        StorageAsRef,
     };
     use fuel_core_types::fuel_types::Bytes32;
     use rand::Rng;
@@ -218,215 +136,8 @@ mod tests {
         bytes.into()
     }
 
-    #[test]
-    fn get() {
-        let key = (&ContractId::from([1u8; 32]), &Bytes32::from([1u8; 32])).into();
-        let stored_value: Bytes32 = Bytes32::from([2u8; 32]);
-
-        let database = &mut Database::default();
-        database
-            .storage::<ContractsState>()
-            .insert(&key, &stored_value)
-            .unwrap();
-
-        assert_eq!(
-            *database
-                .storage::<ContractsState>()
-                .get(&key)
-                .unwrap()
-                .unwrap(),
-            stored_value
-        );
-    }
-
-    #[test]
-    fn put() {
-        let key = (&ContractId::from([1u8; 32]), &Bytes32::from([1u8; 32])).into();
-        let stored_value: Bytes32 = Bytes32::from([2u8; 32]);
-
-        let database = &mut Database::default();
-        database
-            .storage::<ContractsState>()
-            .insert(&key, &stored_value)
-            .unwrap();
-
-        let returned: Bytes32 = *database
-            .storage::<ContractsState>()
-            .get(&key)
-            .unwrap()
-            .unwrap();
-        assert_eq!(returned, stored_value);
-    }
-
-    #[test]
-    fn remove() {
-        let key = (&ContractId::from([1u8; 32]), &Bytes32::from([1u8; 32])).into();
-        let stored_value: Bytes32 = Bytes32::from([2u8; 32]);
-
-        let database = &mut Database::default();
-        database
-            .storage::<ContractsState>()
-            .insert(&key, &stored_value)
-            .unwrap();
-
-        database.storage::<ContractsState>().remove(&key).unwrap();
-
-        assert!(!database
-            .storage::<ContractsState>()
-            .contains_key(&key)
-            .unwrap());
-    }
-
-    #[test]
-    fn exists() {
-        let key = (&ContractId::from([1u8; 32]), &Bytes32::from([1u8; 32])).into();
-        let stored_value: Bytes32 = Bytes32::from([2u8; 32]);
-
-        let database = &mut Database::default();
-        database
-            .storage::<ContractsState>()
-            .insert(&key, &stored_value)
-            .unwrap();
-
-        assert!(database
-            .storage::<ContractsState>()
-            .contains_key(&key)
-            .unwrap());
-    }
-
-    #[test]
-    fn root() {
-        let key = (&ContractId::from([1u8; 32]), &Bytes32::from([1u8; 32])).into();
-        let stored_value: Bytes32 = Bytes32::from([2u8; 32]);
-
-        let mut database = Database::default();
-
-        StorageMutate::<ContractsState>::insert(&mut database, &key, &stored_value)
-            .unwrap();
-
-        let root = database.storage::<ContractsState>().root(key.contract_id());
-        assert!(root.is_ok())
-    }
-
-    #[test]
-    fn root_returns_empty_root_for_invalid_contract() {
-        let invalid_contract_id = ContractId::from([1u8; 32]);
-        let database = Database::default();
-        let empty_root = in_memory::MerkleTree::new().root();
-        let root = database
-            .storage::<ContractsState>()
-            .root(&invalid_contract_id)
-            .unwrap();
-        assert_eq!(root, empty_root)
-    }
-
-    #[test]
-    fn put_updates_the_state_merkle_root_for_the_given_contract() {
-        let contract_id = ContractId::from([1u8; 32]);
-        let database = &mut Database::default();
-
-        // Write the first contract state
-        let state_key = Bytes32::from([1u8; 32]);
-        let state = Bytes32::from([0xff; 32]);
-        let key = (&contract_id, &state_key).into();
-        database
-            .storage::<ContractsState>()
-            .insert(&key, &state)
-            .unwrap();
-
-        // Read the first Merkle root
-        let root_1 = database
-            .storage::<ContractsState>()
-            .root(&contract_id)
-            .unwrap();
-
-        // Write the second contract state
-        let state_key = Bytes32::from([2u8; 32]);
-        let state = Bytes32::from([0xff; 32]);
-        let key = (&contract_id, &state_key).into();
-        database
-            .storage::<ContractsState>()
-            .insert(&key, &state)
-            .unwrap();
-
-        // Read the second Merkle root
-        let root_2 = database
-            .storage::<ContractsState>()
-            .root(&contract_id)
-            .unwrap();
-
-        assert_ne!(root_1, root_2);
-    }
-
-    #[test]
-    fn put_creates_merkle_metadata_when_empty() {
-        let contract_id = ContractId::from([1u8; 32]);
-        let state_key = Bytes32::new([1u8; 32]);
-        let state = Bytes32::from([0xff; 32]);
-        let key = (&contract_id, &state_key).into();
-        let database = &mut Database::default();
-
-        // Write a contract state
-        database
-            .storage::<ContractsState>()
-            .insert(&key, &state)
-            .unwrap();
-
-        // Read the Merkle metadata
-        let metadata = database
-            .storage::<ContractsStateMerkleMetadata>()
-            .get(&contract_id)
-            .unwrap();
-
-        assert!(metadata.is_some());
-    }
-
-    #[test]
-    fn remove_updates_the_state_merkle_root_for_the_given_contract() {
-        let contract_id = ContractId::from([1u8; 32]);
-        let database = &mut Database::default();
-
-        // Write the first contract state
-        let state_key = Bytes32::new([1u8; 32]);
-        let state = Bytes32::from([0xff; 32]);
-        let key = (&contract_id, &state_key).into();
-        database
-            .storage::<ContractsState>()
-            .insert(&key, &state)
-            .unwrap();
-        let root_0 = database
-            .storage::<ContractsState>()
-            .root(&contract_id)
-            .unwrap();
-
-        // Write the second contract state
-        let state_key = Bytes32::new([2u8; 32]);
-        let state = Bytes32::from([0xff; 32]);
-        let key = (&contract_id, &state_key).into();
-        database
-            .storage::<ContractsState>()
-            .insert(&key, &state)
-            .unwrap();
-
-        // Read the first Merkle root
-        let root_1 = database
-            .storage::<ContractsState>()
-            .root(&contract_id)
-            .unwrap();
-
-        // Remove the first contract state
-        let state_key = Bytes32::new([2u8; 32]);
-        let key = (&contract_id, &state_key).into();
-        database.storage::<ContractsState>().remove(&key).unwrap();
-
-        // Read the second Merkle root
-        let root_2 = database
-            .storage::<ContractsState>()
-            .root(&contract_id)
-            .unwrap();
-
-        assert_ne!(root_1, root_2);
-        assert_eq!(root_0, root_2);
+    fn random_contract_id(rng: &mut impl Rng) -> ContractId {
+        ContractId::new(rng.gen())
     }
 
     #[test]
@@ -437,11 +148,11 @@ mod tests {
         };
 
         let rng = &mut StdRng::seed_from_u64(1234);
-        let gen = || Some((random_bytes32(rng), random_bytes32(rng)));
+        let gen = || Some((random_bytes32(rng), random_bytes32(rng).to_vec()));
         let data = core::iter::from_fn(gen).take(5_000).collect::<Vec<_>>();
 
         let contract_id = ContractId::from([1u8; 32]);
-        let init_database = &mut Database::default();
+        let mut init_database = Database::<OnChain>::default().into_transaction();
 
         init_database
             .init_contract_state(&contract_id, data.clone().into_iter())
@@ -451,10 +162,10 @@ mod tests {
             .root(&contract_id)
             .expect("Should get root");
 
-        let seq_database = &mut Database::default();
+        let mut seq_database = Database::<OnChain>::default().into_transaction();
         for (key, value) in data.iter() {
             seq_database
-                .storage::<ContractsState>()
+                .storage_as_mut::<ContractsState>()
                 .insert(&ContractsStateKey::new(&contract_id, key), value)
                 .expect("Should insert a state");
         }
@@ -478,41 +189,240 @@ mod tests {
                 .expect("Should get a state from seq database")
                 .unwrap()
                 .into_owned();
-            assert_eq!(init_value, value);
-            assert_eq!(seq_value, value);
+            assert_eq!(init_value.0, value);
+            assert_eq!(seq_value.0, value);
         }
     }
 
-    #[test]
-    fn remove_deletes_merkle_metadata_when_empty() {
-        let contract_id = ContractId::from([1u8; 32]);
-        let state_key = Bytes32::new([1u8; 32]);
-        let state = Bytes32::from([0xff; 32]);
-        let key = (&contract_id, &state_key).into();
-        let database = &mut Database::default();
+    mod update_contract_state {
+        use core::iter::repeat_with;
+        use fuel_core_chain_config::{
+            ContractStateConfig,
+            Randomize,
+        };
 
-        // Write a contract state
-        database
-            .storage::<ContractsState>()
-            .insert(&key, &state)
-            .unwrap();
+        use fuel_core_storage::iter::IteratorOverTable;
+        use fuel_core_types::fuel_merkle::sparse::{
+            self,
+            MerkleTreeKey,
+        };
+        use rand::{
+            rngs::StdRng,
+            SeedableRng,
+        };
+        use std::collections::HashSet;
 
-        // Read the Merkle metadata
-        database
-            .storage::<ContractsStateMerkleMetadata>()
-            .get(&contract_id)
-            .unwrap()
-            .expect("Expected Merkle metadata to be present");
+        use super::*;
 
-        // Remove the contract asset
-        database.storage::<ContractsState>().remove(&key).unwrap();
+        #[test]
+        fn states_inserted_into_db() {
+            // given
+            let mut rng = StdRng::seed_from_u64(0);
+            let state_groups = repeat_with(|| TableEntry::randomize(&mut rng))
+                .chunks(100)
+                .into_iter()
+                .map(|chunk| chunk.collect_vec())
+                .take(10)
+                .collect_vec();
 
-        // Read the Merkle metadata
-        let metadata = database
-            .storage::<ContractsStateMerkleMetadata>()
-            .get(&contract_id)
-            .unwrap();
+            let database = &mut Database::<OnChain>::default();
 
-        assert!(metadata.is_none());
+            // when
+            for group in &state_groups {
+                database
+                    .update_contract_states(group.clone())
+                    .expect("Should insert contract state");
+            }
+
+            // then
+            let mut states_in_db: Vec<_> = database
+                .iter_all::<ContractsState>(None)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .into_iter()
+                .map(|(key, value)| ContractStateConfig {
+                    key: *key.state_key(),
+                    value: value.0,
+                })
+                .collect();
+
+            let mut original_state = state_groups
+                .into_iter()
+                .flatten()
+                .map(|entry| ContractStateConfig {
+                    key: *entry.key.state_key(),
+                    value: entry.value.into(),
+                })
+                .collect::<Vec<_>>();
+
+            states_in_db.sort();
+            original_state.sort();
+
+            assert_eq!(states_in_db, original_state);
+        }
+
+        fn merkalize(state: &[TableEntry<ContractsState>]) -> [u8; 32] {
+            let state = state.iter().map(|s| {
+                let ckey = s.key;
+                (MerkleTreeKey::new(ckey), &s.value)
+            });
+            sparse::in_memory::MerkleTree::root_from_set(state.into_iter())
+        }
+
+        #[test]
+        fn metadata_updated_single_contract() {
+            // given
+            let mut rng = StdRng::seed_from_u64(0);
+            let contract_id = random_contract_id(&mut rng);
+            let state = repeat_with(|| TableEntry {
+                key: ContractsStateKey::new(
+                    &contract_id,
+                    &Randomize::randomize(&mut rng),
+                ),
+                value: Randomize::randomize(&mut rng),
+            })
+            .take(100)
+            .collect_vec();
+
+            let database = &mut Database::<OnChain>::default();
+
+            // when
+            database.update_contract_states(state.clone()).unwrap();
+
+            // then
+            let expected_root = merkalize(&state);
+            let metadata = database
+                .storage::<ContractsStateMerkleMetadata>()
+                .get(&contract_id)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(*metadata.root(), expected_root);
+        }
+
+        #[test]
+        fn metadata_updated_multiple_contracts() {
+            // given
+            let mut rng = StdRng::seed_from_u64(0);
+
+            let contract_ids = [[1; 32], [2; 32], [3; 32]].map(ContractId::from);
+
+            let state_per_contract = contract_ids
+                .iter()
+                .map(|id| {
+                    repeat_with(|| TableEntry {
+                        key: ContractsStateKey::new(id, &Randomize::randomize(&mut rng)),
+                        value: Randomize::randomize(&mut rng),
+                    })
+                    .take(10)
+                    .collect_vec()
+                })
+                .collect_vec();
+
+            let database = &mut Database::<OnChain>::default();
+
+            // when
+            let states = state_per_contract.clone().into_iter().flatten();
+            database.update_contract_states(states).unwrap();
+
+            // then
+            let all_metadata = contract_ids
+                .into_iter()
+                .map(|contract_id| {
+                    let root = *database
+                        .storage::<ContractsStateMerkleMetadata>()
+                        .get(&contract_id)
+                        .unwrap()
+                        .unwrap()
+                        .root();
+                    (contract_id, root)
+                })
+                .collect::<HashSet<_>>();
+
+            let expected = HashSet::from([
+                (contract_ids[0], merkalize(&state_per_contract[0])),
+                (contract_ids[1], merkalize(&state_per_contract[1])),
+                (contract_ids[2], merkalize(&state_per_contract[2])),
+            ]);
+
+            assert_eq!(all_metadata, expected);
+        }
+
+        #[test]
+        fn metadata_updated_multiple_contracts_shuffled() {
+            // given
+            let mut rng = StdRng::seed_from_u64(0);
+
+            let contract_ids = [[1; 32], [2; 32], [3; 32]].map(ContractId::from);
+            let mut random_state = |contract_id: ContractId| TableEntry {
+                key: ContractsStateKey::new(
+                    &contract_id,
+                    &Randomize::randomize(&mut rng),
+                ),
+                value: Randomize::randomize(&mut rng),
+            };
+            let state_per_contract = contract_ids
+                .iter()
+                .map(|id| {
+                    repeat_with(|| random_state(*id))
+                        .take(10)
+                        .sorted_by_key(|e| e.key)
+                        .collect_vec()
+                })
+                .collect_vec();
+
+            let database = &mut Database::<OnChain>::default();
+
+            // when
+            let contract_0_state = state_per_contract[0]
+                .iter()
+                .chunks(2)
+                .into_iter()
+                .map(|chunk| chunk.collect_vec())
+                .collect_vec();
+            let contract_1_state = state_per_contract[1]
+                .iter()
+                .chunks(2)
+                .into_iter()
+                .map(|chunk| chunk.collect_vec())
+                .collect_vec();
+            let contract_2_state = state_per_contract[2]
+                .iter()
+                .chunks(2)
+                .into_iter()
+                .map(|chunk| chunk.collect_vec())
+                .collect_vec();
+
+            let shuffled_state = contract_0_state
+                .into_iter()
+                .interleave(contract_1_state)
+                .interleave(contract_2_state)
+                .flatten()
+                .cloned()
+                .collect_vec();
+
+            database.update_contract_states(shuffled_state).unwrap();
+
+            // then
+            let all_metadata = contract_ids
+                .into_iter()
+                .map(|contract_id| {
+                    let root = *database
+                        .storage::<ContractsStateMerkleMetadata>()
+                        .get(&contract_id)
+                        .unwrap()
+                        .unwrap()
+                        .root();
+                    (contract_id, root)
+                })
+                .collect::<Vec<_>>();
+
+            let expected = [
+                (contract_ids[0], merkalize(&state_per_contract[0])),
+                (contract_ids[1], merkalize(&state_per_contract[1])),
+                (contract_ids[2], merkalize(&state_per_contract[2])),
+            ];
+            assert_eq!(all_metadata, expected);
+        }
     }
 }

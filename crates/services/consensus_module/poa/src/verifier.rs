@@ -28,6 +28,15 @@ pub fn verify_consensus(
                 .recover(m)
                 .map_or(false, |k| Input::owner(&k) == *signing_key)
         }
+        ConsensusConfig::PoAV2(poa) => {
+            let id = header.id();
+            let m = id.as_message();
+            let signing_key = poa.signing_key_at(*header.height());
+            consensus
+                .signature
+                .recover(m)
+                .map_or(false, |k| Input::owner(&k) == signing_key)
+        }
     }
 }
 
@@ -41,7 +50,7 @@ pub fn verify_block_fields<D: Database>(
         "The PoA block can't have the zero height"
     );
 
-    let prev_height = height - 1u32.into();
+    let prev_height = height.pred().expect("We checked the height above");
     let prev_root = database.block_header_merkle_root(&prev_height)?;
     let header = block.header();
     ensure!(
@@ -62,16 +71,14 @@ pub fn verify_block_fields<D: Database>(
     );
 
     ensure!(
-        header.consensus.application_hash == header.application.hash(),
+        header.application_hash() == &header.application().hash(),
         "The application hash mismatch."
     );
 
-    // TODO: We can check the root of the transactions and the root of the messages here.
-    //  But we do the same in the executor right now during validation mode. I will not check
-    //  it for now. But after merge of the https://github.com/FuelLabs/fuel-core/pull/889 it
-    //  is should be easy to do with the `validate_transactions` method. And maybe we want
-    //  to remove this check from the executor and replace it with check that transaction
-    //  id is not modified during the execution.
+    ensure!(
+        header.validate_transactions(block.transactions()),
+        "The transactions don't match header."
+    );
 
     Ok(())
 }

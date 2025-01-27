@@ -109,9 +109,12 @@ fuel_type_scalar!(Bytes32, Bytes32);
 fuel_type_scalar!(Address, Address);
 fuel_type_scalar!(BlockId, Bytes32);
 fuel_type_scalar!(AssetId, AssetId);
+fuel_type_scalar!(BlobId, BlobId);
 fuel_type_scalar!(ContractId, ContractId);
+fuel_type_scalar!(SubId, Bytes32);
 fuel_type_scalar!(Salt, Salt);
 fuel_type_scalar!(TransactionId, Bytes32);
+fuel_type_scalar!(RelayedTransactionId, Bytes32);
 fuel_type_scalar!(Signature, Bytes64);
 fuel_type_scalar!(Nonce, Nonce);
 
@@ -270,15 +273,16 @@ macro_rules! number_scalar {
     };
 }
 
+number_scalar!(U128, u128);
 number_scalar!(U64, u64);
 number_scalar!(U32, u32);
+number_scalar!(U16, u16);
 
 impl TryFrom<U64> for PanicInstruction {
     type Error = ConversionError;
 
     fn try_from(s: U64) -> Result<Self, Self::Error> {
-        s.0.try_into()
-            .map_err(|_| ConversionError::IntegerConversion)
+        Ok(s.0.into())
     }
 }
 

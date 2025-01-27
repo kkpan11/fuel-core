@@ -1,6 +1,6 @@
 use crate::schema::tx::types::TransactionStatus as ApiTxStatus;
 use fuel_core_storage::Result as StorageResult;
-use fuel_core_txpool::service::TxStatusMessage;
+use fuel_core_txpool::TxStatusMessage;
 use fuel_core_types::{
     fuel_types::Bytes32,
     services::txpool::TransactionStatus as TxPoolTxStatus,
@@ -17,16 +17,7 @@ mod test;
 #[cfg_attr(test, mockall::automock)]
 pub(crate) trait TxnStatusChangeState {
     /// Return the transaction status from the tx pool and database.
-    fn get_tx_status(&self, id: Bytes32) -> StorageResult<Option<TxPoolTxStatus>>;
-}
-
-impl<F> TxnStatusChangeState for F
-where
-    F: Fn(Bytes32) -> StorageResult<Option<TxPoolTxStatus>> + Send + Sync,
-{
-    fn get_tx_status(&self, id: Bytes32) -> StorageResult<Option<TxPoolTxStatus>> {
-        self(id)
-    }
+    async fn get_tx_status(&self, id: Bytes32) -> StorageResult<Option<TxPoolTxStatus>>;
 }
 
 #[tracing::instrument(skip(state, stream), fields(transaction_id = %transaction_id))]
@@ -42,6 +33,7 @@ where
     // has a status.
     let check_db_first = state
         .get_tx_status(transaction_id)
+        .await
         .transpose()
         .map(TxStatusMessage::from);
 
@@ -68,7 +60,10 @@ where
             }
 
             match status {
-                TxStatusMessage::Status(status) => Ok(status.into()),
+                TxStatusMessage::Status(status) => {
+                    let status = ApiTxStatus::new(transaction_id, status);
+                    Ok(status)
+                },
                 // Map a failed status to an error for the api.
                 TxStatusMessage::FailedStatus => {
                     Err(anyhow::anyhow!("Failed to get transaction status"))

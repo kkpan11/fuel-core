@@ -17,6 +17,7 @@ use fuel_core_types::{
         Input,
         Output,
         Script,
+        Transaction,
         TransactionBuilder,
         TxPointer,
         UniqueIdentifier,
@@ -41,7 +42,7 @@ async fn tx_pointer_set_from_genesis_for_coin_and_contract_inputs() {
     // setup genesis contract
     let contract_tx_pointer = TxPointer::new(7.into(), rng.gen());
     let (_, contract_id) =
-        test_builder.setup_contract(vec![], None, None, Some(contract_tx_pointer));
+        test_builder.setup_contract(vec![], vec![], Some(contract_tx_pointer));
 
     // setup genesis coin
     let coin_tx_pointer = TxPointer::new(starting_block, rng.gen());
@@ -52,11 +53,10 @@ async fn tx_pointer_set_from_genesis_for_coin_and_contract_inputs() {
 
     // add coin to genesis block
     test_builder.initial_coins.push(CoinConfig {
-        tx_id: Some(*coin_utxo_id.tx_id()),
-        output_index: Some(coin_utxo_id.output_index()),
-        tx_pointer_block_height: Some(coin_tx_pointer.block_height()),
-        tx_pointer_tx_idx: Some(coin_tx_pointer.tx_index()),
-        maturity: None,
+        tx_id: *coin_utxo_id.tx_id(),
+        output_index: coin_utxo_id.output_index(),
+        tx_pointer_block_height: coin_tx_pointer.block_height(),
+        tx_pointer_tx_idx: coin_tx_pointer.tx_index(),
         owner,
         amount,
         asset_id: Default::default(),
@@ -81,12 +81,14 @@ async fn tx_pointer_set_from_genesis_for_coin_and_contract_inputs() {
     client.submit_and_await_commit(&tx).await.unwrap();
 
     // verify that the tx returned from the api has tx pointers set matching the genesis config
-    let ret_tx = client
+    let ret_tx: Transaction = client
         .transaction(&tx.id(&Default::default()))
         .await
         .unwrap()
         .unwrap()
-        .transaction;
+        .transaction
+        .try_into()
+        .unwrap();
     let ret_script = ret_tx.as_script().unwrap();
 
     let coin_input = &ret_script.inputs()[0];
@@ -106,13 +108,13 @@ async fn tx_pointer_set_from_previous_block() {
     // verify tx_pointers of inputs on second tx correspond to the first transaction
     let mut rng = StdRng::seed_from_u64(2322);
     let mut test_builder = TestSetupBuilder::new(2322);
-    let block_height = 40;
+    let previous_block_height = 40;
 
     // setup genesis contract
-    let (_, contract_id) = test_builder.setup_contract(vec![], None, None, None);
+    let (_, contract_id) = test_builder.setup_contract(vec![], vec![], None);
 
     // set starting block >= tx_pointer.block_height()
-    test_builder.starting_block = Some(block_height.into());
+    test_builder.starting_block = Some(previous_block_height.into());
 
     // setup genesis coin
     let coin_utxo_id: UtxoId = rng.gen();
@@ -131,16 +133,20 @@ async fn tx_pointer_set_from_previous_block() {
         srv: _dont_drop,
         ..
     } = test_builder.finalize().await;
+    let new_genesis_block_height = previous_block_height + 1;
 
     // submit tx1
     let tx1 = tx1.into();
     client.submit_and_await_commit(&tx1).await.unwrap();
-    let ret_tx1 = client
+    let next_block_height_after_genesis = new_genesis_block_height + 1;
+    let ret_tx1: Transaction = client
         .transaction(&tx1.id(&Default::default()))
         .await
         .unwrap()
         .unwrap()
-        .transaction;
+        .transaction
+        .try_into()
+        .unwrap();
     let ret_tx1 = ret_tx1.as_script().unwrap();
 
     // setup a second transaction that uses UTXOs from tx1
@@ -154,17 +160,19 @@ async fn tx_pointer_set_from_previous_block() {
     let tx2 = tx2.into();
     client.submit_and_await_commit(&tx2).await.unwrap();
 
-    let ret_tx2 = client
+    let ret_tx2: Transaction = client
         .transaction(&tx2.id(&Default::default()))
         .await
         .unwrap()
         .unwrap()
-        .transaction;
+        .transaction
+        .try_into()
+        .unwrap();
 
     let ret_tx2 = ret_tx2.as_script().unwrap();
 
     // verify coin tx_pointer is correctly set
-    let expected_tx_pointer = TxPointer::new((block_height + 1u32).into(), 1);
+    let expected_tx_pointer = TxPointer::new(next_block_height_after_genesis.into(), 0);
     assert_eq!(
         *ret_tx2.inputs()[0].tx_pointer().unwrap(),
         expected_tx_pointer
@@ -185,7 +193,7 @@ async fn tx_pointer_unset_when_utxo_validation_disabled() {
     let block_height = 40u32;
 
     // setup genesis contract
-    let (_, contract_id) = test_builder.setup_contract(vec![], None, None, None);
+    let (_, contract_id) = test_builder.setup_contract(vec![], vec![], None);
 
     // set starting block >= tx_pointer.block_height()
     test_builder.starting_block = Some(block_height.into());
@@ -203,12 +211,15 @@ async fn tx_pointer_unset_when_utxo_validation_disabled() {
     let tx = script.into();
     client.submit_and_await_commit(&tx).await.unwrap();
 
-    let ret_tx = client
+    let ret_tx: Transaction = client
         .transaction(&tx.id(&Default::default()))
         .await
         .unwrap()
         .unwrap()
-        .transaction;
+        .transaction
+        .try_into()
+        .unwrap();
+
     let ret_tx = ret_tx.as_script().unwrap();
     // verify coin input tx_pointer is null
     assert_eq!(
@@ -230,15 +241,13 @@ fn script_tx(
     change_owner: Address,
 ) -> Script {
     TransactionBuilder::script(vec![], vec![])
-        .gas_limit(10000)
-        .gas_price(1)
+        .script_gas_limit(10000)
         .add_unsigned_coin_input(
             secret_key,
             coin_utxo_id,
             amount,
             Default::default(),
             // use a zeroed out txpointer
-            Default::default(),
             Default::default(),
         )
         .add_input(Input::contract(

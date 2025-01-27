@@ -1,66 +1,91 @@
+use super::database_description::{
+    indexation_availability,
+    IndexationKind,
+};
 use crate::database::{
-    Column,
+    database_description::{
+        DatabaseDescription,
+        DatabaseMetadata,
+    },
     Database,
     Error as DatabaseError,
-    Result as DatabaseResult,
 };
-use fuel_core_chain_config::ChainConfig;
+use fuel_core_storage::{
+    blueprint::plain::Plain,
+    codec::postcard::Postcard,
+    structured_storage::TableWithBlueprint,
+    Error as StorageError,
+    Mappable,
+    Result as StorageResult,
+    StorageAsRef,
+    StorageInspect,
+};
 
-pub(crate) const DB_VERSION_KEY: &[u8] = b"version";
-pub(crate) const CHAIN_NAME_KEY: &[u8] = b"chain_name";
-/// Tracks the total number of transactions written to the chain
-/// It's useful for analyzing TPS or other metrics.
-pub(crate) const TX_COUNT: &[u8] = b"total_tx_count";
+/// The table that stores all metadata about the database.
+pub struct MetadataTable<Description>(core::marker::PhantomData<Description>);
 
-/// Can be used to perform migrations in the future.
-pub(crate) const DB_VERSION: u32 = 0x00;
+impl<Description> Mappable for MetadataTable<Description>
+where
+    Description: DatabaseDescription,
+{
+    type Key = ();
+    type OwnedKey = ();
+    type Value = DatabaseMetadata<Description::Height>;
+    type OwnedValue = Self::Value;
+}
 
-impl Database {
-    /// Ensures the database is initialized and that the database version is correct
-    pub fn init(&self, config: &ChainConfig) -> DatabaseResult<()> {
-        // initialize chain name if not set
-        if self.get_chain_name()?.is_none() {
-            self.insert(CHAIN_NAME_KEY, Column::Metadata, &config.chain_name)
-                .and_then(|v: Option<String>| {
-                    if v.is_some() {
-                        Err(DatabaseError::ChainAlreadyInitialized)
-                    } else {
-                        Ok(())
-                    }
-                })?;
-        }
+impl<Description> TableWithBlueprint for MetadataTable<Description>
+where
+    Description: DatabaseDescription,
+{
+    type Blueprint = Plain<Postcard, Postcard>;
+    type Column = Description::Column;
 
-        // Ensure the database version is correct
-        if let Some(version) = self.get::<u32>(DB_VERSION_KEY, Column::Metadata)? {
-            if version != DB_VERSION {
-                return Err(DatabaseError::InvalidDatabaseVersion {
-                    found: version,
-                    expected: DB_VERSION,
-                })?
+    fn column() -> Self::Column {
+        Description::metadata_column()
+    }
+}
+
+impl<Description, Stage> Database<Description, Stage>
+where
+    Description: DatabaseDescription,
+    Self: StorageInspect<MetadataTable<Description>, Error = StorageError>,
+{
+    /// Ensures the version is correct.
+    pub fn check_version(&self) -> StorageResult<()> {
+        let Some(metadata) = self.storage::<MetadataTable<Description>>().get(&())?
+        else {
+            return Ok(());
+        };
+
+        if metadata.version() != Description::version() {
+            return Err(DatabaseError::InvalidDatabaseVersion {
+                found: metadata.version(),
+                expected: Description::version(),
             }
-        } else {
-            let _: Option<u32> =
-                self.insert(DB_VERSION_KEY, Column::Metadata, &DB_VERSION)?;
+            .into())
         }
+
         Ok(())
     }
 
-    pub fn get_chain_name(&self) -> DatabaseResult<Option<String>> {
-        self.get(CHAIN_NAME_KEY, Column::Metadata)
+    pub fn latest_height_from_metadata(
+        &self,
+    ) -> StorageResult<Option<Description::Height>> {
+        let metadata = self.storage::<MetadataTable<Description>>().get(&())?;
+
+        let metadata = metadata.map(|metadata| *metadata.height());
+
+        Ok(metadata)
     }
 
-    pub fn increase_tx_count(&self, new_txs: u64) -> DatabaseResult<u64> {
-        // TODO: how should tx count be initialized after regenesis?
-        let current_tx_count: u64 =
-            self.get(TX_COUNT, Column::Metadata)?.unwrap_or_default();
-        // Using saturating_add because this value doesn't significantly impact the correctness of execution.
-        let new_tx_count = current_tx_count.saturating_add(new_txs);
-        self.insert::<_, _, u64>(TX_COUNT, Column::Metadata, &new_tx_count)?;
-        Ok(new_tx_count)
-    }
+    pub fn indexation_available(&self, kind: IndexationKind) -> StorageResult<bool> {
+        let metadata = self
+            .storage::<MetadataTable<Description>>()
+            .get(&())?
+            .map(|metadata| metadata.into_owned());
 
-    pub fn get_tx_count(&self) -> DatabaseResult<u64> {
-        self.get(TX_COUNT, Column::Metadata)
-            .map(|v| v.unwrap_or_default())
+        let indexation_availability = indexation_availability::<Description>(metadata);
+        Ok(indexation_availability.contains(&kind))
     }
 }

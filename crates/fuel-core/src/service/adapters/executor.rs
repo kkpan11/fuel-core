@@ -1,106 +1,67 @@
-use super::MaybeRelayerAdapter;
 use crate::{
-    database::Database,
-    executor::{
-        ExecutionBlockWithSource,
-        Executor,
-        MaybeCheckedTransaction,
-    },
-    service::adapters::{
-        ExecutorAdapter,
-        TransactionsSource,
-    },
+    database::RelayerIterableKeyValueView,
+    service::adapters::TransactionsSource,
 };
-use fuel_core_executor::refs::ContractStorageTrait;
-use fuel_core_storage::{
-    transactional::StorageTransaction,
-    Error as StorageError,
-};
+use fuel_core_executor::ports::MaybeCheckedTransaction;
+use fuel_core_txpool::Constraints;
 use fuel_core_types::{
     blockchain::primitives::DaBlockHeight,
-    entities::message::Message,
-    fuel_tx,
-    fuel_tx::Receipt,
-    fuel_types::Nonce,
-    services::{
-        block_producer::Components,
-        executor::{
-            Result as ExecutorResult,
-            UncommittedResult,
-        },
-    },
+    services::relayer::Event,
 };
+use std::sync::Arc;
 
-impl crate::executor::TransactionsSource for TransactionsSource {
-    fn next(&self, gas_limit: u64) -> Vec<MaybeCheckedTransaction> {
-        self.txpool
-            .select_transactions(gas_limit)
+impl fuel_core_executor::ports::TransactionsSource for TransactionsSource {
+    fn next(
+        &self,
+        gas_limit: u64,
+        transactions_limit: u16,
+        block_transaction_size_limit: u32,
+    ) -> Vec<MaybeCheckedTransaction> {
+        self.tx_pool
+            .exclusive_lock()
+            .extract_transactions_for_block(Constraints {
+                minimal_gas_price: self.minimum_gas_price,
+                max_gas: gas_limit,
+                maximum_txs: transactions_limit,
+                maximum_block_size: block_transaction_size_limit,
+            })
             .into_iter()
-            .map(|tx| MaybeCheckedTransaction::CheckedTransaction(tx.as_ref().into()))
+            .map(|tx| {
+                let transaction = Arc::unwrap_or_clone(tx);
+                let version = transaction.used_consensus_parameters_version();
+                MaybeCheckedTransaction::CheckedTransaction(transaction.into(), version)
+            })
             .collect()
     }
 }
 
-impl ExecutorAdapter {
-    pub(crate) fn _execute_without_commit(
-        &self,
-        block: ExecutionBlockWithSource<TransactionsSource>,
-    ) -> ExecutorResult<UncommittedResult<StorageTransaction<Database>>> {
-        let executor = Executor {
-            database: self.relayer.database.clone(),
-            relayer: self.relayer.clone(),
-            config: self.config.clone(),
-        };
-        executor.execute_without_commit(block, self.config.as_ref().into())
-    }
-
-    pub(crate) fn _dry_run(
-        &self,
-        block: Components<fuel_tx::Transaction>,
-        utxo_validation: Option<bool>,
-    ) -> ExecutorResult<Vec<Vec<Receipt>>> {
-        let executor = Executor {
-            database: self.relayer.database.clone(),
-            relayer: self.relayer.clone(),
-            config: self.config.clone(),
-        };
-        executor.dry_run(block, utxo_validation)
-    }
-}
-
-/// Implemented to satisfy: `GenesisCommitment for ContractRef<&'a mut Database>`
-impl ContractStorageTrait for Database {
-    type InnerError = StorageError;
-}
-
-impl crate::executor::RelayerPort for MaybeRelayerAdapter {
-    fn get_message(
-        &self,
-        id: &Nonce,
-        da_height: &DaBlockHeight,
-    ) -> anyhow::Result<Option<Message>> {
+impl fuel_core_executor::ports::RelayerPort for RelayerIterableKeyValueView {
+    fn enabled(&self) -> bool {
         #[cfg(feature = "relayer")]
         {
-            match self.relayer_synced.as_ref() {
-                Some(sync) => sync.get_message(id, da_height),
-                None => {
-                    if *da_height <= self.da_deploy_height {
-                        Ok(fuel_core_storage::StorageAsRef::storage::<
-                            fuel_core_storage::tables::Messages,
-                        >(&self.database)
-                        .get(id)?
-                        .map(std::borrow::Cow::into_owned))
-                    } else {
-                        Ok(None)
-                    }
-                }
-            }
+            true
         }
         #[cfg(not(feature = "relayer"))]
         {
-            let _ = id;
+            false
+        }
+    }
+
+    fn get_events(&self, da_height: &DaBlockHeight) -> anyhow::Result<Vec<Event>> {
+        #[cfg(feature = "relayer")]
+        {
+            use fuel_core_storage::StorageAsRef;
+            let events = self
+                .storage::<fuel_core_relayer::storage::EventsHistory>()
+                .get(da_height)?
+                .map(|cow| cow.into_owned())
+                .unwrap_or_default();
+            Ok(events)
+        }
+        #[cfg(not(feature = "relayer"))]
+        {
             let _ = da_height;
-            Ok(None)
+            Ok(vec![])
         }
     }
 }

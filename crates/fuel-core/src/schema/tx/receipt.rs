@@ -1,26 +1,24 @@
-use crate::schema::{
-    contract::Contract,
-    scalars::{
-        Address,
-        AssetId,
-        Bytes32,
-        ContractId,
-        HexString,
-        Nonce,
-        U64,
-    },
+use crate::schema::scalars::{
+    Address,
+    AssetId,
+    Bytes32,
+    ContractId,
+    HexString,
+    Nonce,
+    U64,
 };
 use async_graphql::{
     Enum,
     Object,
 };
-use derive_more::Display;
 use fuel_core_types::{
     fuel_asm::Word,
     fuel_tx,
 };
 
-#[derive(Copy, Clone, Debug, Display, Enum, Eq, PartialEq, strum_macros::EnumIter)]
+#[derive(
+    Copy, Clone, Debug, derive_more::Display, Enum, Eq, PartialEq, strum_macros::EnumIter,
+)]
 pub enum ReceiptType {
     Call,
     Return,
@@ -61,7 +59,7 @@ pub struct Receipt(pub fuel_tx::Receipt);
 
 #[Object]
 impl Receipt {
-    async fn contract(&self) -> Option<Contract> {
+    async fn id(&self) -> Option<ContractId> {
         Some((*self.0.id()?).into())
     }
     async fn pc(&self) -> Option<U64> {
@@ -70,7 +68,7 @@ impl Receipt {
     async fn is(&self) -> Option<U64> {
         self.0.is().map(Into::into)
     }
-    async fn to(&self) -> Option<Contract> {
+    async fn to(&self) -> Option<ContractId> {
         self.0.to().copied().map(Into::into)
     }
     async fn to_address(&self) -> Option<Address> {
@@ -139,6 +137,8 @@ impl Receipt {
     async fn nonce(&self) -> Option<Nonce> {
         self.0.nonce().copied().map(Nonce)
     }
+
+    /// Set in the case of a Panic receipt to indicate a missing contract input id
     async fn contract_id(&self) -> Option<ContractId> {
         self.0.contract_id().map(|id| ContractId(*id))
     }

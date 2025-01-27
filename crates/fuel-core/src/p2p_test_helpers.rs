@@ -1,26 +1,43 @@
 //! # Helpers for creating networks of nodes
 
 use crate::{
-    chain_config::ChainConfig,
-    database::Database,
+    chain_config::{
+        coin_config_helpers::CoinConfigGenerator,
+        CoinConfig,
+    },
+    combined_database::CombinedDatabase,
+    database::{
+        database_description::off_chain::OffChain,
+        Database,
+    },
+    fuel_core_graphql_api::storage::transactions::TransactionStatuses,
     p2p::Multiaddr,
+    schema::tx::types::TransactionStatus,
     service::{
-        genesis::maybe_initialize_state,
         Config,
         FuelService,
-        ServiceTrait,
     },
+};
+use fuel_core_chain_config::{
+    ConsensusConfig,
+    StateConfig,
 };
 use fuel_core_p2p::{
     codecs::postcard::PostcardCodec,
     network_service::FuelP2PService,
+    p2p_service::FuelP2PEvent,
+    request_response::messages::{
+        RequestMessage,
+        V2ResponseMessage,
+    },
+    service::to_message_acceptance,
 };
 use fuel_core_poa::{
     ports::BlockImporter,
     Trigger,
 };
 use fuel_core_storage::{
-    tables::Transactions,
+    transactional::AtomicView,
     StorageAsRef,
 };
 use fuel_core_types::{
@@ -35,7 +52,6 @@ use fuel_core_types::{
         TransactionBuilder,
         TxId,
         UniqueIdentifier,
-        UtxoId,
     },
     fuel_types::{
         Address,
@@ -43,12 +59,12 @@ use fuel_core_types::{
         ChainId,
     },
     secrecy::Secret,
+    services::p2p::GossipsubMessageAcceptance,
+    signer::SignMode,
 };
 use futures::StreamExt;
-use itertools::Itertools;
 use rand::{
     rngs::StdRng,
-    Rng,
     SeedableRng,
 };
 use std::{
@@ -57,10 +73,34 @@ use std::{
         Index,
         IndexMut,
     },
-    sync::Arc,
     time::Duration,
 };
 use tokio::sync::broadcast;
+
+#[derive(Copy, Clone)]
+pub enum BootstrapType {
+    BootstrapNodes,
+    ReservedNodes,
+}
+
+/// Set of values that will be overridden in the node's configuration
+#[derive(Clone, Debug)]
+pub struct CustomizeConfig {
+    min_exec_gas_price: Option<u64>,
+}
+
+impl CustomizeConfig {
+    pub fn no_overrides() -> Self {
+        Self {
+            min_exec_gas_price: None,
+        }
+    }
+
+    pub fn min_gas_price(mut self, min_gas_price: u64) -> Self {
+        self.min_exec_gas_price = Some(min_gas_price);
+        self
+    }
+}
 
 #[derive(Clone)]
 /// Setup for a producer node
@@ -71,6 +111,12 @@ pub struct ProducerSetup {
     pub secret: SecretKey,
     /// Number of test transactions to create for this producer.
     pub num_test_txs: usize,
+    /// Enable full utxo stateful validation.
+    pub utxo_validation: bool,
+    /// Indicates the type of initial connections.
+    pub bootstrap_type: BootstrapType,
+    /// Config Overrides
+    pub config_overrides: CustomizeConfig,
 }
 
 #[derive(Clone)]
@@ -80,6 +126,12 @@ pub struct ValidatorSetup {
     pub name: String,
     /// Public key of the producer to sync from.
     pub pub_key: Address,
+    /// Enable full utxo stateful validation.
+    pub utxo_validation: bool,
+    /// Indicates the type of initial connections.
+    pub bootstrap_type: BootstrapType,
+    /// Config Overrides
+    pub config_overrides: CustomizeConfig,
 }
 
 #[derive(Clone)]
@@ -111,11 +163,13 @@ pub struct NamedNodes(pub HashMap<String, Node>);
 
 impl Bootstrap {
     /// Spawn a bootstrap node.
-    pub async fn new(node_config: &Config) -> Self {
-        let bootstrap_config = extract_p2p_config(node_config);
+    pub async fn new(node_config: &Config) -> anyhow::Result<Self> {
+        let bootstrap_config = extract_p2p_config(node_config).await;
         let codec = PostcardCodec::new(bootstrap_config.max_block_size);
-        let mut bootstrap = FuelP2PService::new(bootstrap_config, codec);
-        bootstrap.start().await.unwrap();
+        let (sender, _) =
+            broadcast::channel(bootstrap_config.reserved_nodes.len().saturating_add(1));
+        let mut bootstrap = FuelP2PService::new(sender, bootstrap_config, codec).await?;
+        bootstrap.start().await?;
 
         let listeners = bootstrap.multiaddrs();
         let (kill, mut shutdown) = broadcast::channel(1);
@@ -126,12 +180,39 @@ impl Bootstrap {
                         assert!(result.is_ok());
                         break;
                     }
-                    _ = bootstrap.next_event() => {}
+                    event = bootstrap.next_event() => {
+                        // The bootstrap node only forwards data without validating it.
+                        match event {
+                            Some(FuelP2PEvent::GossipsubMessage {
+                                peer_id,
+                                message_id,
+                                ..
+                            }) => {
+                                bootstrap.report_message_validation_result(
+                                    &message_id,
+                                    peer_id,
+                                    to_message_acceptance(&GossipsubMessageAcceptance::Accept)
+                                )
+                            },
+                            Some(FuelP2PEvent::InboundRequestMessage {
+                                request_id,
+                                request_message
+                            }) => {
+                                if request_message == RequestMessage::TxPoolAllTransactionsIds {
+                                    let _ = bootstrap.send_response_msg(
+                                        request_id,
+                                        V2ResponseMessage::TxPoolAllTransactionsIds(Ok(vec![])),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         });
 
-        Bootstrap { listeners, kill }
+        Ok(Bootstrap { listeners, kill })
     }
 
     pub fn listeners(&self) -> Vec<Multiaddr> {
@@ -148,11 +229,13 @@ pub async fn make_nodes(
     bootstrap_setup: impl IntoIterator<Item = Option<BootstrapSetup>>,
     producers_setup: impl IntoIterator<Item = Option<ProducerSetup>>,
     validators_setup: impl IntoIterator<Item = Option<ValidatorSetup>>,
+    config: Option<Config>,
 ) -> Nodes {
     let producers: Vec<_> = producers_setup.into_iter().collect();
 
     let mut rng = StdRng::seed_from_u64(11);
 
+    let mut coin_generator = CoinConfigGenerator::new();
     let txs_coins: Vec<_> = producers
         .iter()
         .map(|p| {
@@ -160,20 +243,22 @@ pub async fn make_nodes(
             let all: Vec<_> = (0..num_test_txs)
                 .map(|_| {
                     let secret = SecretKey::random(&mut rng);
-                    let utxo_id: UtxoId = rng.gen();
-                    let initial_coin =
-                        ChainConfig::initial_coin(secret, 10000, Some(utxo_id));
+                    let initial_coin = CoinConfig {
+                        // set idx to prevent overlapping utxo_ids when
+                        // merging with existing coins from config
+                        output_index: 10,
+                        ..coin_generator.generate_with(secret, 10000)
+                    };
                     let tx = TransactionBuilder::script(
                         vec![op::ret(RegId::ONE)].into_iter().collect(),
                         vec![],
                     )
-                    .gas_limit(100000)
+                    .script_gas_limit(100000)
                     .add_unsigned_coin_input(
                         secret,
-                        utxo_id,
+                        initial_coin.utxo_id(),
                         initial_coin.amount,
                         initial_coin.asset_id,
-                        Default::default(),
                         Default::default(),
                     )
                     .finalize_as_transaction();
@@ -186,11 +271,9 @@ pub async fn make_nodes(
         .collect();
 
     let mut producers_with_txs = Vec::with_capacity(producers.len());
-    let mut chain_config = ChainConfig::local_testnet();
-    chain_config
-        .consensus_parameters
-        .contract_params
-        .max_storage_slots = 1 << 17; // 131072
+
+    let mut config = config.unwrap_or_else(Config::local_node);
+    let mut state_config = StateConfig::from_reader(&config.snapshot_reader).unwrap();
 
     for (all, producer) in txs_coins.into_iter().zip(producers.into_iter()) {
         match all {
@@ -198,14 +281,7 @@ pub async fn make_nodes(
                 let mut txs = Vec::with_capacity(all.len());
                 for (tx, initial_coin) in all {
                     txs.push(tx);
-                    chain_config
-                        .initial_state
-                        .as_mut()
-                        .unwrap()
-                        .coins
-                        .as_mut()
-                        .unwrap()
-                        .push(initial_coin);
+                    state_config.coins.push(initial_coin);
                 }
                 producers_with_txs.push(Some((producer.unwrap(), txs)));
             }
@@ -215,27 +291,31 @@ pub async fn make_nodes(
         }
     }
 
+    config.snapshot_reader = config
+        .snapshot_reader
+        .clone()
+        .with_state_config(state_config);
+
     let bootstrap_nodes: Vec<Bootstrap> =
         futures::stream::iter(bootstrap_setup.into_iter().enumerate())
             .then(|(i, boot)| {
-                let chain_config = chain_config.clone();
+                let config = config.clone();
                 async move {
-                    let chain_config = chain_config.clone();
+                    let config = config.clone();
                     let name = boot.as_ref().map_or(String::new(), |s| s.name.clone());
                     let mut node_config = make_config(
                         (!name.is_empty())
                             .then_some(name)
                             .unwrap_or_else(|| format!("b:{i}")),
-                        chain_config.clone(),
+                        config.clone(),
+                        CustomizeConfig::no_overrides(),
                     );
                     if let Some(BootstrapSetup { pub_key, .. }) = boot {
-                        match &mut node_config.chain_conf.consensus {
-                            crate::chain_config::ConsensusConfig::PoA { signing_key } => {
-                                *signing_key = pub_key;
-                            }
-                        }
+                        update_signing_key(&mut node_config, pub_key);
                     }
-                    Bootstrap::new(&node_config).await
+                    Bootstrap::new(&node_config)
+                        .await
+                        .expect("Failed to create bootstrap node")
                 }
             })
             .collect()
@@ -245,28 +325,55 @@ pub async fn make_nodes(
 
     let mut producers = Vec::with_capacity(producers_with_txs.len());
     for (i, s) in producers_with_txs.into_iter().enumerate() {
-        let chain_config = chain_config.clone();
+        let config = config.clone();
         let name = s.as_ref().map_or(String::new(), |s| s.0.name.clone());
+        let overrides = s
+            .clone()
+            .map_or(CustomizeConfig::no_overrides(), |s| s.0.config_overrides);
         let mut node_config = make_config(
             (!name.is_empty())
                 .then_some(name)
                 .unwrap_or_else(|| format!("p:{i}")),
-            chain_config.clone(),
+            config.clone(),
+            overrides,
         );
 
         let mut test_txs = Vec::with_capacity(0);
         node_config.block_production = Trigger::Instant;
-        node_config.p2p.as_mut().unwrap().bootstrap_nodes = boots.clone();
 
-        if let Some((ProducerSetup { secret, .. }, txs)) = s {
-            let pub_key = secret.public_key();
-            match &mut node_config.chain_conf.consensus {
-                crate::chain_config::ConsensusConfig::PoA { signing_key } => {
-                    *signing_key = Input::owner(&pub_key);
+        if let Some((
+            ProducerSetup {
+                secret,
+                utxo_validation,
+                bootstrap_type,
+                ..
+            },
+            txs,
+        )) = s
+        {
+            match bootstrap_type {
+                BootstrapType::BootstrapNodes => {
+                    node_config
+                        .p2p
+                        .as_mut()
+                        .unwrap()
+                        .bootstrap_nodes
+                        .clone_from(&boots);
+                }
+                BootstrapType::ReservedNodes => {
+                    node_config
+                        .p2p
+                        .as_mut()
+                        .unwrap()
+                        .reserved_nodes
+                        .clone_from(&boots);
                 }
             }
 
-            node_config.consensus_key = Some(Secret::new(secret.into()));
+            node_config.utxo_validation = utxo_validation;
+            update_signing_key(&mut node_config, Input::owner(&secret.public_key()));
+
+            node_config.consensus_signer = SignMode::Key(Secret::new(secret.into()));
 
             test_txs = txs;
         }
@@ -277,23 +384,48 @@ pub async fn make_nodes(
 
     let mut validators = vec![];
     for (i, s) in validators_setup.into_iter().enumerate() {
-        let chain_config = chain_config.clone();
+        let config = config.clone();
         let name = s.as_ref().map_or(String::new(), |s| s.name.clone());
+        let overrides = s
+            .clone()
+            .map_or(CustomizeConfig::no_overrides(), |s| s.config_overrides);
         let mut node_config = make_config(
             (!name.is_empty())
                 .then_some(name)
                 .unwrap_or_else(|| format!("v:{i}")),
-            chain_config.clone(),
+            config.clone(),
+            overrides,
         );
         node_config.block_production = Trigger::Never;
-        node_config.p2p.as_mut().unwrap().bootstrap_nodes = boots.clone();
 
-        if let Some(ValidatorSetup { pub_key, .. }) = s {
-            match &mut node_config.chain_conf.consensus {
-                crate::chain_config::ConsensusConfig::PoA { signing_key } => {
-                    *signing_key = pub_key;
+        if let Some(ValidatorSetup {
+            pub_key,
+            utxo_validation,
+            bootstrap_type,
+            ..
+        }) = s
+        {
+            node_config.utxo_validation = utxo_validation;
+
+            match bootstrap_type {
+                BootstrapType::BootstrapNodes => {
+                    node_config
+                        .p2p
+                        .as_mut()
+                        .unwrap()
+                        .bootstrap_nodes
+                        .clone_from(&boots);
+                }
+                BootstrapType::ReservedNodes => {
+                    node_config
+                        .p2p
+                        .as_mut()
+                        .unwrap()
+                        .reserved_nodes
+                        .clone_from(&boots);
                 }
             }
+            update_signing_key(&mut node_config, pub_key);
         }
         validators.push(make_node(node_config, Vec::with_capacity(0)).await)
     }
@@ -305,22 +437,52 @@ pub async fn make_nodes(
     }
 }
 
-pub fn make_config(name: String, chain_config: ChainConfig) -> Config {
-    let mut node_config = Config::local_node();
-    node_config.chain_conf = chain_config;
+fn update_signing_key(config: &mut Config, key: Address) {
+    let snapshot_reader = &config.snapshot_reader;
+
+    let mut chain_config = snapshot_reader.chain_config().clone();
+    match &mut chain_config.consensus {
+        ConsensusConfig::PoA { signing_key } => {
+            *signing_key = key;
+        }
+        ConsensusConfig::PoAV2(poa) => {
+            poa.set_genesis_signing_key(key);
+        }
+    }
+    config.snapshot_reader = snapshot_reader.clone().with_chain_config(chain_config)
+}
+
+pub fn make_config(
+    name: String,
+    mut node_config: Config,
+    config_overrides: CustomizeConfig,
+) -> Config {
+    node_config.p2p = Config::local_node().p2p;
     node_config.utxo_validation = true;
     node_config.name = name;
+    if let Some(min_gas_price) = config_overrides.min_exec_gas_price {
+        node_config.min_exec_gas_price = min_gas_price;
+    }
     node_config
 }
 
 pub async fn make_node(node_config: Config, test_txs: Vec<Transaction>) -> Node {
     let db = Database::in_memory();
+    // Test coverage slows down the execution a lot, and while running all tests,
+    // it may require a lot of time to start the node. We have a
+    // timeout here to watch infinity loops, so it is okay to use 120 seconds.
+    let time_limit = Duration::from_secs(120);
     let node = tokio::time::timeout(
-        Duration::from_secs(1),
+        time_limit,
         FuelService::from_database(db.clone(), node_config),
     )
     .await
-    .expect("All services should start in less than 1 second")
+    .unwrap_or_else(|_| {
+        panic!(
+            "All services should start in less than {} seconds",
+            time_limit.as_secs()
+        )
+    })
     .expect("The `FuelService should start without error");
 
     let config = node.shared.config.clone();
@@ -332,17 +494,24 @@ pub async fn make_node(node_config: Config, test_txs: Vec<Transaction>) -> Node 
     }
 }
 
-fn extract_p2p_config(node_config: &Config) -> fuel_core_p2p::config::Config {
+async fn extract_p2p_config(node_config: &Config) -> fuel_core_p2p::config::Config {
     let bootstrap_config = node_config.p2p.clone();
-    let db = Database::in_memory();
-    maybe_initialize_state(node_config, &db).unwrap();
+    let db = CombinedDatabase::in_memory();
+    crate::service::genesis::execute_and_commit_genesis_block(node_config, &db)
+        .await
+        .unwrap();
     bootstrap_config
         .unwrap()
-        .init(db.get_genesis().unwrap())
+        .init(db.on_chain().latest_view().unwrap().get_genesis().unwrap())
         .unwrap()
 }
 
 impl Node {
+    /// Returns the vector of valid transactions for pre-initialized state.
+    pub fn test_transactions(&self) -> &Vec<Transaction> {
+        &self.test_txs
+    }
+
     /// Waits for `number_of_blocks` and each block should be `is_local`
     pub async fn wait_for_blocks(&self, number_of_blocks: usize, is_local: bool) {
         let mut stream = self
@@ -352,30 +521,45 @@ impl Node {
             .block_stream()
             .take(number_of_blocks);
         while let Some(block) = stream.next().await {
-            assert_eq!(block.is_locally_produced(), is_local);
+            if block.is_locally_produced() != is_local {
+                panic!(
+                    "Block produced by the wrong node while was \
+                    waiting for `{number_of_blocks}` and is_local=`{is_local}`"
+                );
+            }
         }
     }
 
     /// Wait for the node to reach consistency with the given transactions.
     pub async fn consistency(&mut self, txs: &HashMap<Bytes32, Transaction>) {
-        let Self { db, .. } = self;
-        let mut blocks = self.node.shared.block_importer.block_stream();
-        while !not_found_txs(db, txs).is_empty() {
-            tokio::select! {
-                result = blocks.next() => {
-                    result.unwrap();
-                }
-                _ = self.node.await_stop() => {
-                    panic!("Got a stop signal")
+        let db = self.node.shared.database.off_chain();
+        loop {
+            let not_found = not_found_txs(db, txs);
+
+            if not_found.is_empty() {
+                break;
+            }
+
+            let tx_id = not_found[0];
+            let mut wait_transaction =
+                self.node.transaction_status_change(tx_id).await.unwrap();
+
+            loop {
+                tokio::select! {
+                    result = wait_transaction.next() => {
+                        let status = result.unwrap().unwrap();
+
+                        if matches!(status, TransactionStatus::Failed { .. })
+                            || matches!(status, TransactionStatus::Success { .. }) {
+                            break
+                        }
+                    }
+                    _ = self.node.await_shutdown() => {
+                        panic!("Got a stop signal")
+                    }
                 }
             }
         }
-
-        let count = db
-            .all_transactions(None, None)
-            .filter_ok(|tx| tx.is_script())
-            .count();
-        assert_eq!(count, txs.len());
     }
 
     /// Wait for the node to reach consistency with the given transactions within 10 seconds.
@@ -400,20 +584,15 @@ impl Node {
     pub async fn insert_txs(&self) -> HashMap<Bytes32, Transaction> {
         let mut expected = HashMap::new();
         for tx in &self.test_txs {
-            let tx_result = self
-                .node
+            let tx_id = tx.id(&ChainId::default());
+            self.node
                 .shared
-                .txpool
-                .insert(vec![Arc::new(tx.clone())])
+                .txpool_shared_state
+                .insert(tx.clone())
                 .await
-                .pop()
-                .unwrap()
                 .unwrap();
 
-            let tx = Transaction::from(tx_result.inserted.as_ref());
-            expected.insert(tx.id(&ChainId::default()), tx);
-
-            assert!(tx_result.removed.is_empty());
+            expected.insert(tx_id, tx.clone());
         }
         expected
     }
@@ -429,18 +608,25 @@ impl Node {
 
     /// Stop a node.
     pub async fn shutdown(&mut self) {
-        self.node.stop_and_await().await.unwrap();
+        self.node
+            .send_stop_signal_and_await_shutdown()
+            .await
+            .unwrap();
     }
 }
 
 fn not_found_txs<'iter>(
-    db: &'iter Database,
+    db: &'iter Database<OffChain>,
     txs: &'iter HashMap<Bytes32, Transaction>,
 ) -> Vec<TxId> {
     let mut not_found = vec![];
     txs.iter().for_each(|(id, tx)| {
         assert_eq!(id, &tx.id(&Default::default()));
-        if !db.storage::<Transactions>().contains_key(id).unwrap() {
+        let found = db
+            .storage::<TransactionStatuses>()
+            .contains_key(id)
+            .unwrap();
+        if !found {
             not_found.push(*id);
         }
     });
@@ -449,10 +635,20 @@ fn not_found_txs<'iter>(
 
 impl ProducerSetup {
     pub fn new(secret: SecretKey) -> Self {
+        Self::new_with_overrides(secret, CustomizeConfig::no_overrides())
+    }
+
+    pub fn new_with_overrides(
+        secret: SecretKey,
+        config_overrides: CustomizeConfig,
+    ) -> Self {
         Self {
             name: Default::default(),
             secret,
             num_test_txs: Default::default(),
+            utxo_validation: true,
+            bootstrap_type: BootstrapType::BootstrapNodes,
+            config_overrides,
         }
     }
 
@@ -469,19 +665,57 @@ impl ProducerSetup {
             ..self
         }
     }
+
+    pub fn utxo_validation(self, utxo_validation: bool) -> Self {
+        Self {
+            utxo_validation,
+            ..self
+        }
+    }
+
+    pub fn bootstrap_type(self, bootstrap_type: BootstrapType) -> Self {
+        Self {
+            bootstrap_type,
+            ..self
+        }
+    }
 }
 
 impl ValidatorSetup {
     pub fn new(pub_key: Address) -> Self {
+        Self::new_with_overrides(pub_key, CustomizeConfig::no_overrides())
+    }
+
+    pub fn new_with_overrides(
+        pub_key: Address,
+        config_overrides: CustomizeConfig,
+    ) -> Self {
         Self {
             pub_key,
             name: Default::default(),
+            utxo_validation: true,
+            bootstrap_type: BootstrapType::BootstrapNodes,
+            config_overrides,
         }
     }
 
     pub fn with_name(self, name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            ..self
+        }
+    }
+
+    pub fn utxo_validation(self, utxo_validation: bool) -> Self {
+        Self {
+            utxo_validation,
+            ..self
+        }
+    }
+
+    pub fn bootstrap_type(self, bootstrap_type: BootstrapType) -> Self {
+        Self {
+            bootstrap_type,
             ..self
         }
     }

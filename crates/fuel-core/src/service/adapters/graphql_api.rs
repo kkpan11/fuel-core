@@ -1,72 +1,54 @@
+use super::{
+    BlockImporterAdapter,
+    BlockProducerAdapter,
+    ConsensusParametersProvider,
+    SharedMemoryPool,
+    StaticGasPrice,
+};
 use crate::{
-    database::{
-        transactions::OwnedTransactionIndexCursor,
-        Database,
-    },
+    database::OnChainIterableKeyValueView,
     fuel_core_graphql_api::ports::{
+        worker,
+        worker::BlockAt,
         BlockProducerPort,
-        DatabaseBlocks,
-        DatabaseChain,
-        DatabaseCoins,
-        DatabaseContracts,
+        ConsensusProvider,
         DatabaseMessageProof,
-        DatabaseMessages,
-        DatabasePort,
-        DatabaseTransactions,
-        DryRunExecution,
+        GasPriceEstimate,
+        P2pPort,
         TxPoolPort,
     },
-    service::adapters::TxPoolAdapter,
+    graphql_api::ports::MemoryPool,
+    service::{
+        adapters::{
+            import_result_provider::ImportResultProvider,
+            P2PAdapter,
+            TxPoolAdapter,
+        },
+        vm_pool::MemoryFromPool,
+    },
 };
 use async_trait::async_trait;
-use fuel_core_services::stream::{
-    BoxFuture,
-    BoxStream,
-};
-use fuel_core_storage::{
-    iter::{
-        BoxedIter,
-        IntoBoxedIter,
-        IterDirection,
-    },
-    not_found,
-    Error as StorageError,
-    Result as StorageResult,
-};
+use fuel_core_services::stream::BoxStream;
+use fuel_core_storage::Result as StorageResult;
 use fuel_core_txpool::{
-    service::TxStatusMessage,
-    types::{
-        ContractId,
-        TxId,
-    },
+    TxPoolStats,
+    TxStatusMessage,
 };
 use fuel_core_types::{
-    blockchain::primitives::{
-        BlockId,
-        DaBlockHeight,
-    },
-    entities::message::{
-        MerkleProof,
-        Message,
-    },
+    blockchain::header::ConsensusParametersVersion,
+    entities::relayer::message::MerkleProof,
     fuel_tx::{
-        Address,
-        AssetId,
-        Receipt as TxReceipt,
+        Bytes32,
+        ConsensusParameters,
         Transaction,
-        TxPointer,
-        UtxoId,
+        TxId,
     },
-    fuel_types::{
-        BlockHeight,
-        Nonce,
-    },
+    fuel_types::BlockHeight,
     services::{
-        graphql_api::ContractBalance,
-        txpool::{
-            InsertionResult,
-            TransactionStatus,
-        },
+        block_importer::SharedImportResult,
+        executor::TransactionExecutionStatus,
+        p2p::PeerInfo,
+        txpool::TransactionStatus,
     },
     tai64::Tai64,
 };
@@ -75,193 +57,185 @@ use std::{
     sync::Arc,
 };
 
-impl DatabaseBlocks for Database {
-    fn block_id(&self, height: &BlockHeight) -> StorageResult<BlockId> {
-        self.get_block_id(height)
-            .and_then(|height| height.ok_or(not_found!("BlockId")))
-    }
-
-    fn blocks_ids(
-        &self,
-        start: Option<BlockHeight>,
-        direction: IterDirection,
-    ) -> BoxedIter<'_, StorageResult<(BlockHeight, BlockId)>> {
-        self.all_block_ids(start, direction)
-            .map(|result| result.map_err(StorageError::from))
-            .into_boxed()
-    }
-
-    fn ids_of_latest_block(&self) -> StorageResult<(BlockHeight, BlockId)> {
-        Ok(self
-            .ids_of_latest_block()
-            .transpose()
-            .ok_or(not_found!("BlockId"))??)
-    }
-}
-
-impl DatabaseTransactions for Database {
-    fn tx_status(&self, tx_id: &TxId) -> StorageResult<TransactionStatus> {
-        Ok(self
-            .get_tx_status(tx_id)
-            .transpose()
-            .ok_or(not_found!("TransactionId"))??)
-    }
-
-    fn owned_transactions_ids(
-        &self,
-        owner: Address,
-        start: Option<TxPointer>,
-        direction: IterDirection,
-    ) -> BoxedIter<StorageResult<(TxPointer, TxId)>> {
-        let start = start.map(|tx_pointer| OwnedTransactionIndexCursor {
-            block_height: tx_pointer.block_height(),
-            tx_idx: tx_pointer.tx_index(),
-        });
-        self.owned_transactions(owner, start, Some(direction))
-            .map(|result| result.map_err(StorageError::from))
-            .into_boxed()
-    }
-}
-
-impl DatabaseMessages for Database {
-    fn owned_message_ids(
-        &self,
-        owner: &Address,
-        start_message_id: Option<Nonce>,
-        direction: IterDirection,
-    ) -> BoxedIter<'_, StorageResult<Nonce>> {
-        self.owned_message_ids(owner, start_message_id, Some(direction))
-            .map(|result| result.map_err(StorageError::from))
-            .into_boxed()
-    }
-
-    fn all_messages(
-        &self,
-        start_message_id: Option<Nonce>,
-        direction: IterDirection,
-    ) -> BoxedIter<'_, StorageResult<Message>> {
-        self.all_messages(start_message_id, Some(direction))
-            .map(|result| result.map_err(StorageError::from))
-            .into_boxed()
-    }
-
-    fn message_is_spent(&self, nonce: &Nonce) -> StorageResult<bool> {
-        self.message_is_spent(nonce)
-    }
-
-    fn message_exists(&self, nonce: &Nonce) -> StorageResult<bool> {
-        self.message_exists(nonce)
-    }
-}
-
-impl DatabaseCoins for Database {
-    fn owned_coins_ids(
-        &self,
-        owner: &Address,
-        start_coin: Option<UtxoId>,
-        direction: IterDirection,
-    ) -> BoxedIter<'_, StorageResult<UtxoId>> {
-        self.owned_coins_ids(owner, start_coin, Some(direction))
-            .map(|res| res.map_err(StorageError::from))
-            .into_boxed()
-    }
-}
-
-impl DatabaseContracts for Database {
-    fn contract_balances(
-        &self,
-        contract: ContractId,
-        start_asset: Option<AssetId>,
-        direction: IterDirection,
-    ) -> BoxedIter<StorageResult<ContractBalance>> {
-        self.contract_balances(contract, start_asset, Some(direction))
-            .map(move |result| {
-                result
-                    .map_err(StorageError::from)
-                    .map(|(asset_id, amount)| ContractBalance {
-                        owner: contract,
-                        amount,
-                        asset_id,
-                    })
-            })
-            .into_boxed()
-    }
-}
-
-impl DatabaseChain for Database {
-    fn chain_name(&self) -> StorageResult<String> {
-        pub const DEFAULT_NAME: &str = "Fuel.testnet";
-
-        Ok(self
-            .get_chain_name()?
-            .unwrap_or_else(|| DEFAULT_NAME.to_string()))
-    }
-
-    fn da_height(&self) -> StorageResult<DaBlockHeight> {
-        #[cfg(feature = "relayer")]
-        {
-            use fuel_core_relayer::ports::RelayerDb;
-            self.get_finalized_da_height()
-        }
-        #[cfg(not(feature = "relayer"))]
-        {
-            Ok(0u64.into())
-        }
-    }
-}
-
-impl DatabasePort for Database {}
+mod off_chain;
+mod on_chain;
 
 #[async_trait]
 impl TxPoolPort for TxPoolAdapter {
-    fn transaction(&self, id: TxId) -> Option<Transaction> {
-        self.service
+    async fn transaction(&self, id: TxId) -> anyhow::Result<Option<Transaction>> {
+        Ok(self
+            .service
             .find_one(id)
-            .map(|info| info.tx().clone().deref().into())
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?
+            .map(|info| info.tx().clone().deref().into()))
     }
 
-    fn submission_time(&self, id: TxId) -> Option<Tai64> {
-        self.service
+    async fn submission_time(&self, id: TxId) -> anyhow::Result<Option<Tai64>> {
+        Ok(self
+            .service
             .find_one(id)
-            .map(|info| Tai64::from_unix(info.submitted_time().as_secs() as i64))
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?
+            .map(|info| {
+                Tai64::from_unix(
+                    info.creation_instant()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("Time can't be lower than 0")
+                        .as_secs() as i64,
+                )
+            }))
     }
 
-    async fn insert(
+    async fn insert(&self, tx: Transaction) -> anyhow::Result<()> {
+        self.service
+            .insert(tx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    fn tx_update_subscribe(
         &self,
-        txs: Vec<Arc<Transaction>>,
-    ) -> Vec<anyhow::Result<InsertionResult>> {
-        self.service.insert(txs).await
+        id: TxId,
+    ) -> anyhow::Result<BoxStream<TxStatusMessage>> {
+        self.service.tx_update_subscribe(id)
     }
 
-    fn tx_update_subscribe(&self, id: TxId) -> BoxFuture<BoxStream<TxStatusMessage>> {
-        Box::pin(self.service.tx_update_subscribe(id))
+    fn latest_pool_stats(&self) -> TxPoolStats {
+        self.service.latest_stats()
     }
 }
 
-impl DatabaseMessageProof for Database {
+impl DatabaseMessageProof for OnChainIterableKeyValueView {
     fn block_history_proof(
         &self,
         message_block_height: &BlockHeight,
         commit_block_height: &BlockHeight,
     ) -> StorageResult<MerkleProof> {
-        Database::block_history_proof(self, message_block_height, commit_block_height)
+        self.block_history_proof(message_block_height, commit_block_height)
     }
 }
 
 #[async_trait]
-impl DryRunExecution for BlockProducerAdapter {
-    async fn dry_run_tx(
+impl BlockProducerPort for BlockProducerAdapter {
+    async fn dry_run_txs(
         &self,
-        transaction: Transaction,
+        transactions: Vec<Transaction>,
         height: Option<BlockHeight>,
+        time: Option<Tai64>,
         utxo_validation: Option<bool>,
-    ) -> anyhow::Result<Vec<TxReceipt>> {
+        gas_price: Option<u64>,
+    ) -> anyhow::Result<Vec<TransactionExecutionStatus>> {
         self.block_producer
-            .dry_run(transaction, height, utxo_validation)
+            .dry_run(transactions, height, time, utxo_validation, gas_price)
             .await
     }
 }
 
-impl BlockProducerPort for BlockProducerAdapter {}
+#[async_trait::async_trait]
+impl P2pPort for P2PAdapter {
+    async fn all_peer_info(&self) -> anyhow::Result<Vec<PeerInfo>> {
+        #[cfg(feature = "p2p")]
+        {
+            use fuel_core_types::services::p2p::HeartbeatData;
+            if let Some(service) = &self.service {
+                let peers = service.get_all_peers().await?;
+                Ok(peers
+                    .into_iter()
+                    .map(|(peer_id, peer_info)| PeerInfo {
+                        id: fuel_core_types::services::p2p::PeerId::from(
+                            peer_id.to_bytes(),
+                        ),
+                        peer_addresses: peer_info
+                            .peer_addresses
+                            .iter()
+                            .map(|addr| addr.to_string())
+                            .collect(),
+                        client_version: None,
+                        heartbeat_data: HeartbeatData {
+                            block_height: peer_info.heartbeat_data.block_height,
+                            last_heartbeat: peer_info.heartbeat_data.last_heartbeat_sys,
+                        },
+                        app_score: peer_info.score,
+                    })
+                    .collect())
+            } else {
+                Ok(vec![])
+            }
+        }
+        #[cfg(not(feature = "p2p"))]
+        {
+            Ok(vec![])
+        }
+    }
+}
 
-use super::BlockProducerAdapter;
+impl worker::TxPool for TxPoolAdapter {
+    fn send_complete(
+        &self,
+        id: Bytes32,
+        block_height: &BlockHeight,
+        status: TransactionStatus,
+    ) {
+        self.service.notify_complete_tx(id, block_height, status)
+    }
+}
+
+impl GasPriceEstimate for StaticGasPrice {
+    fn worst_case_gas_price(&self, _height: BlockHeight) -> Option<u64> {
+        Some(self.gas_price)
+    }
+}
+
+impl ConsensusProvider for ConsensusParametersProvider {
+    fn latest_consensus_params(&self) -> Arc<ConsensusParameters> {
+        self.shared_state.latest_consensus_parameters()
+    }
+
+    fn consensus_params_at_version(
+        &self,
+        version: &ConsensusParametersVersion,
+    ) -> anyhow::Result<Arc<ConsensusParameters>> {
+        Ok(self.shared_state.get_consensus_parameters(version)?)
+    }
+}
+
+#[derive(Clone)]
+pub struct GraphQLBlockImporter {
+    block_importer_adapter: BlockImporterAdapter,
+    import_result_provider_adapter: ImportResultProvider,
+}
+
+impl GraphQLBlockImporter {
+    pub fn new(
+        block_importer_adapter: BlockImporterAdapter,
+        import_result_provider_adapter: ImportResultProvider,
+    ) -> Self {
+        Self {
+            block_importer_adapter,
+            import_result_provider_adapter,
+        }
+    }
+}
+
+impl worker::BlockImporter for GraphQLBlockImporter {
+    fn block_events(&self) -> BoxStream<SharedImportResult> {
+        self.block_importer_adapter.events_shared_result()
+    }
+
+    fn block_event_at_height(
+        &self,
+        height: BlockAt,
+    ) -> anyhow::Result<SharedImportResult> {
+        self.import_result_provider_adapter.result_at_height(height)
+    }
+}
+
+#[async_trait::async_trait]
+impl MemoryPool for SharedMemoryPool {
+    type Memory = MemoryFromPool;
+
+    async fn get_memory(&self) -> Self::Memory {
+        self.memory_pool.take_raw().await
+    }
+}

@@ -30,7 +30,7 @@ use std::collections::BTreeSet;
 async fn submit_utxo_verified_tx_with_min_gas_price() {
     let mut rng = StdRng::seed_from_u64(2322);
     let mut test_builder = TestSetupBuilder::new(2322);
-    let (_, contract_id) = test_builder.setup_contract(vec![], None, None, None);
+    let (_, contract_id) = test_builder.setup_contract(vec![], vec![], None);
     // initialize 10 random transactions that transfer coins and call a contract
     let transactions = (1..=10)
         .map(|i| {
@@ -38,13 +38,11 @@ async fn submit_utxo_verified_tx_with_min_gas_price() {
                 op::ret(RegId::ONE).to_bytes().into_iter().collect(),
                 vec![],
             )
-            .gas_limit(10000)
-            .gas_price(1)
+            .script_gas_limit(10000)
             .add_unsigned_coin_input(
                 SecretKey::random(&mut rng),
                 rng.gen(),
                 1000 + i,
-                Default::default(),
                 Default::default(),
                 Default::default(),
             )
@@ -76,12 +74,14 @@ async fn submit_utxo_verified_tx_with_min_gas_price() {
         let tx = tx.into();
         client.submit_and_await_commit(&tx).await.unwrap();
         // verify that the tx returned from the api matches the submitted tx
-        let ret_tx = client
+        let ret_tx: Transaction = client
             .transaction(&tx.id(&ChainId::default()))
             .await
             .unwrap()
             .unwrap()
-            .transaction;
+            .transaction
+            .try_into()
+            .unwrap();
 
         let transaction_result = client
             .transaction_status(&ret_tx.id(&ChainId::default()))
@@ -89,9 +89,10 @@ async fn submit_utxo_verified_tx_with_min_gas_price() {
             .ok()
             .unwrap();
 
-        if let TransactionStatus::Success { block_id, .. } = transaction_result.clone() {
-            let block_id = block_id.parse().unwrap();
-            let block_exists = client.block(&block_id).await.unwrap();
+        if let TransactionStatus::Success { block_height, .. } =
+            transaction_result.clone()
+        {
+            let block_exists = client.block_by_height(block_height).await.unwrap();
 
             assert!(block_exists.is_some());
         }
@@ -111,13 +112,13 @@ async fn submit_utxo_verified_tx_below_min_gas_price_fails() {
         op::ret(RegId::ONE).to_bytes().into_iter().collect(),
         vec![],
     )
-    .gas_limit(100)
-    .gas_price(1)
+    .add_fee_input()
+    .script_gas_limit(100)
     .finalize_as_transaction();
 
     // initialize node with higher minimum gas price
     let mut test_builder = TestSetupBuilder::new(2322u64);
-    test_builder.min_gas_price = 10;
+    test_builder.starting_gas_price = 10;
     let TestContext {
         client,
         srv: _dont_drop,
@@ -127,11 +128,15 @@ async fn submit_utxo_verified_tx_below_min_gas_price_fails() {
     let result = client.submit(&tx).await;
 
     assert!(result.is_err());
-    assert!(result
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("The gas price is too low"));
+    let error = result.err().unwrap().to_string();
+    assert!(
+        error.contains(
+            "The provided max fee can't cover the transaction cost. \
+            The minimal gas price should be 11, while it is 0"
+        ),
+        "{}",
+        error
+    );
 }
 
 // verify that dry run can disable utxo_validation by simulating a transaction with unsigned
@@ -145,7 +150,7 @@ async fn dry_run_override_utxo_validation() {
         op::ret(RegId::ONE).to_bytes().into_iter().collect(),
         vec![],
     )
-    .gas_limit(10000)
+    .script_gas_limit(10000)
     .add_input(Input::coin_signed(
         rng.gen(),
         rng.gen(),
@@ -153,7 +158,6 @@ async fn dry_run_override_utxo_validation() {
         AssetId::default(),
         Default::default(),
         0,
-        Default::default(),
     ))
     .add_input(Input::coin_signed(
         rng.gen(),
@@ -162,7 +166,6 @@ async fn dry_run_override_utxo_validation() {
         asset_id,
         Default::default(),
         0,
-        Default::default(),
     ))
     .add_output(Output::change(rng.gen(), 0, asset_id))
     .add_witness(Default::default())
@@ -170,7 +173,16 @@ async fn dry_run_override_utxo_validation() {
 
     let context = TestSetupBuilder::new(2322).finalize().await;
 
-    let log = context.client.dry_run_opt(&tx, Some(false)).await.unwrap();
+    let tx_statuses = context
+        .client
+        .dry_run_opt(&[tx], Some(false), None)
+        .await
+        .unwrap();
+    let log = tx_statuses
+        .last()
+        .expect("Nonempty response")
+        .result
+        .receipts();
     assert_eq!(2, log.len());
 
     assert!(matches!(log[0],
@@ -190,7 +202,7 @@ async fn dry_run_no_utxo_validation_override() {
         op::ret(RegId::ONE).to_bytes().into_iter().collect(),
         vec![],
     )
-    .gas_limit(1000)
+    .script_gas_limit(1000)
     .add_input(Input::coin_signed(
         rng.gen(),
         rng.gen(),
@@ -198,7 +210,6 @@ async fn dry_run_no_utxo_validation_override() {
         AssetId::default(),
         Default::default(),
         0,
-        Default::default(),
     ))
     .add_input(Input::coin_signed(
         rng.gen(),
@@ -207,7 +218,6 @@ async fn dry_run_no_utxo_validation_override() {
         asset_id,
         Default::default(),
         0,
-        Default::default(),
     ))
     .add_output(Output::change(rng.gen(), 0, asset_id))
     .add_witness(Default::default())
@@ -216,13 +226,13 @@ async fn dry_run_no_utxo_validation_override() {
     let client = TestSetupBuilder::new(2322).finalize().await.client;
 
     // verify that the client validated the inputs and failed the tx
-    let res = client.dry_run_opt(&tx, None).await;
+    let res = client.dry_run_opt(&[tx], None, None).await;
     assert!(res.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_tx_submission_produces_expected_blocks() {
-    const TEST_TXS: usize = 10;
+    const TEST_TXS: i32 = 10;
 
     let mut rng = StdRng::seed_from_u64(2322u64);
     let mut test_builder = TestSetupBuilder::new(100);
@@ -235,12 +245,11 @@ async fn concurrent_tx_submission_produces_expected_blocks() {
                 op::ret(RegId::ONE).to_bytes().into_iter().collect(),
                 vec![],
             )
-            .gas_limit(10000)
+            .script_gas_limit(10000)
             .add_unsigned_coin_input(
                 secret,
                 rng.gen(),
                 rng.gen_range((100000 + i as u64)..(200000 + i as u64)),
-                Default::default(),
                 Default::default(),
                 Default::default(),
             )
@@ -300,7 +309,10 @@ async fn concurrent_tx_submission_produces_expected_blocks() {
         .results
         .iter()
         .flat_map(|b| {
-            b.transactions.iter().skip(1 /* coinbase */).copied()
+            b.transactions
+                .iter()
+                .take(b.transactions.len().saturating_sub(1) /* coinbase */)
+                .copied()
         })
         .dedup_with_count()
         .map(|(count, id)| {

@@ -1,10 +1,12 @@
 use crate::{
-    codecs::{
-        postcard::PostcardCodec,
-        NetworkCodec,
+    cached_view::CachedView,
+    codecs::postcard::PostcardCodec,
+    config::{
+        Config,
+        NotInitialized,
     },
-    config::Config,
     gossipsub::messages::{
+        GossipTopicTag,
         GossipsubBroadcastRequest,
         GossipsubMessage,
     },
@@ -16,30 +18,42 @@ use crate::{
     ports::{
         BlockHeightImporter,
         P2pDb,
+        TxPool,
     },
     request_response::messages::{
-        OutboundResponse,
+        OnResponse,
+        OnResponseWithPeerSelection,
         RequestMessage,
-        ResponseChannelItem,
+        ResponseMessageErrorCode,
+        ResponseSender,
+        V2ResponseMessage,
     },
 };
 use anyhow::anyhow;
+use fuel_core_metrics::p2p_metrics::set_blocks_requested;
 use fuel_core_services::{
     stream::BoxStream,
+    AsyncProcessor,
     RunnableService,
     RunnableTask,
     ServiceRunner,
     StateWatcher,
+    SyncProcessor,
+    TaskNextAction,
+    TraceErr,
 };
+use fuel_core_storage::transactional::AtomicView;
 use fuel_core_types::{
-    blockchain::{
-        block::Block,
-        consensus::ConsensusVote,
-        SealedBlock,
-        SealedBlockHeader,
+    blockchain::SealedBlockHeader,
+    fuel_tx::{
+        Transaction,
+        TxId,
+        UniqueIdentifier,
     },
-    fuel_tx::Transaction,
-    fuel_types::BlockHeight,
+    fuel_types::{
+        BlockHeight,
+        ChainId,
+    },
     services::p2p::{
         peer_reputation::{
             AppScore,
@@ -49,6 +63,7 @@ use fuel_core_types::{
         GossipData,
         GossipsubMessageAcceptance,
         GossipsubMessageInfo,
+        NetworkableTransactionPool,
         PeerId as FuelPeerId,
         TransactionGossipData,
         Transactions,
@@ -59,19 +74,27 @@ use futures::{
     StreamExt,
 };
 use libp2p::{
-    gossipsub::MessageAcceptance,
+    gossipsub::{
+        MessageAcceptance,
+        PublishError,
+    },
+    request_response::InboundRequestId,
     PeerId,
 };
-use libp2p_request_response::RequestId;
 use std::{
     fmt::Debug,
+    future::Future,
     ops::Range,
     sync::Arc,
 };
+use thiserror::Error;
 use tokio::{
     sync::{
         broadcast,
-        mpsc,
+        mpsc::{
+            self,
+            Receiver,
+        },
         oneshot,
     },
     time::{
@@ -81,27 +104,50 @@ use tokio::{
 };
 use tracing::warn;
 
-pub type Service<D> = ServiceRunner<Task<FuelP2PService<PostcardCodec>, D, SharedState>>;
+const CHANNEL_SIZE: usize = 1024 * 10;
 
-enum TaskRequest {
+pub type Service<V, T> = ServiceRunner<UninitializedTask<V, SharedState, T>>;
+
+#[derive(Debug, Error)]
+pub enum TaskError {
+    #[error("No peer found to send request to")]
+    NoPeerFound,
+}
+
+pub enum TaskRequest {
     // Broadcast requests to p2p network
     BroadcastTransaction(Arc<Transaction>),
-    BroadcastBlock(Arc<Block>),
-    BroadcastVote(Arc<ConsensusVote>),
-    // Request to get one-off data from p2p network
-    GetPeerIds(oneshot::Sender<Vec<PeerId>>),
-    GetBlock {
-        height: BlockHeight,
-        channel: oneshot::Sender<Option<SealedBlock>>,
+    // Request to get information about all connected peers
+    GetAllPeerInfo {
+        channel: oneshot::Sender<Vec<(PeerId, PeerInfo)>>,
     },
     GetSealedHeaders {
         block_height_range: Range<u32>,
-        channel: oneshot::Sender<(PeerId, Option<Vec<SealedBlockHeader>>)>,
+        channel: OnResponseWithPeerSelection<
+            Result<Vec<SealedBlockHeader>, ResponseMessageErrorCode>,
+        >,
     },
     GetTransactions {
         block_height_range: Range<u32>,
+        channel: OnResponseWithPeerSelection<
+            Result<Vec<Transactions>, ResponseMessageErrorCode>,
+        >,
+    },
+    GetTransactionsFromPeer {
+        block_height_range: Range<u32>,
         from_peer: PeerId,
-        channel: oneshot::Sender<Option<Vec<Transactions>>>,
+        channel: OnResponse<Result<Vec<Transactions>, ResponseMessageErrorCode>>,
+    },
+    TxPoolGetAllTxIds {
+        from_peer: PeerId,
+        channel: OnResponse<Result<Vec<TxId>, ResponseMessageErrorCode>>,
+    },
+    TxPoolGetFullTransactions {
+        tx_ids: Vec<TxId>,
+        from_peer: PeerId,
+        channel: OnResponse<
+            Result<Vec<Option<NetworkableTransactionPool>>, ResponseMessageErrorCode>,
+        >,
     },
     // Responds back to the p2p network
     RespondWithGossipsubMessageReport((GossipsubMessageInfo, GossipsubMessageAcceptance)),
@@ -110,11 +156,68 @@ enum TaskRequest {
         score: AppScore,
         reporting_service: &'static str,
     },
+    DatabaseTransactionsLookUp {
+        response: Result<Vec<Transactions>, ResponseMessageErrorCode>,
+        request_id: InboundRequestId,
+    },
+    DatabaseHeaderLookUp {
+        response: Result<Vec<SealedBlockHeader>, ResponseMessageErrorCode>,
+        request_id: InboundRequestId,
+    },
+    TxPoolAllTransactionsIds {
+        response: Result<Vec<TxId>, ResponseMessageErrorCode>,
+        request_id: InboundRequestId,
+    },
+    TxPoolFullTransactions {
+        response:
+            Result<Vec<Option<NetworkableTransactionPool>>, ResponseMessageErrorCode>,
+        request_id: InboundRequestId,
+    },
 }
 
 impl Debug for TaskRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TaskRequest")
+        match self {
+            TaskRequest::BroadcastTransaction(_) => {
+                write!(f, "TaskRequest::BroadcastTransaction")
+            }
+            TaskRequest::GetSealedHeaders { .. } => {
+                write!(f, "TaskRequest::GetSealedHeaders")
+            }
+            TaskRequest::GetTransactions { .. } => {
+                write!(f, "TaskRequest::GetTransactions")
+            }
+            TaskRequest::GetTransactionsFromPeer { .. } => {
+                write!(f, "TaskRequest::GetTransactionsFromPeer")
+            }
+            TaskRequest::TxPoolGetAllTxIds { .. } => {
+                write!(f, "TaskRequest::TxPoolGetAllTxIds")
+            }
+            TaskRequest::TxPoolGetFullTransactions { .. } => {
+                write!(f, "TaskRequest::TxPoolGetFullTransactions")
+            }
+            TaskRequest::RespondWithGossipsubMessageReport(_) => {
+                write!(f, "TaskRequest::RespondWithGossipsubMessageReport")
+            }
+            TaskRequest::RespondWithPeerReport { .. } => {
+                write!(f, "TaskRequest::RespondWithPeerReport")
+            }
+            TaskRequest::GetAllPeerInfo { .. } => {
+                write!(f, "TaskRequest::GetPeerInfo")
+            }
+            TaskRequest::DatabaseTransactionsLookUp { .. } => {
+                write!(f, "TaskRequest::DatabaseTransactionsLookUp")
+            }
+            TaskRequest::DatabaseHeaderLookUp { .. } => {
+                write!(f, "TaskRequest::DatabaseHeaderLookUp")
+            }
+            TaskRequest::TxPoolAllTransactionsIds { .. } => {
+                write!(f, "TaskRequest::TxPoolAllTransactionsIds")
+            }
+            TaskRequest::TxPoolFullTransactions { .. } => {
+                write!(f, "TaskRequest::TxPoolFullTransactions")
+            }
+        }
     }
 }
 
@@ -125,7 +228,6 @@ pub enum HeartBeatPeerReportReason {
 }
 
 pub trait TaskP2PService: Send {
-    fn get_peer_ids(&self) -> Vec<PeerId>;
     fn get_all_peer_info(&self) -> Vec<(&PeerId, &PeerInfo)>;
     fn get_peer_id_with_height(&self, height: &BlockHeight) -> Option<PeerId>;
 
@@ -135,18 +237,20 @@ pub trait TaskP2PService: Send {
         &mut self,
         message: GossipsubBroadcastRequest,
     ) -> anyhow::Result<()>;
+
     fn send_request_msg(
         &mut self,
         peer_id: Option<PeerId>,
         request_msg: RequestMessage,
-        channel_item: ResponseChannelItem,
+        on_response: ResponseSender,
     ) -> anyhow::Result<()>;
 
     fn send_response_msg(
         &mut self,
-        request_id: RequestId,
-        message: OutboundResponse,
+        request_id: InboundRequestId,
+        message: V2ResponseMessage,
     ) -> anyhow::Result<()>;
+
     fn report_message(
         &mut self,
         message: GossipsubMessageInfo,
@@ -161,11 +265,18 @@ pub trait TaskP2PService: Send {
     ) -> anyhow::Result<()>;
 
     fn update_block_height(&mut self, height: BlockHeight) -> anyhow::Result<()>;
+
+    fn update_metrics<T>(&self, update_fn: T)
+    where
+        T: FnOnce();
 }
 
-impl TaskP2PService for FuelP2PService<PostcardCodec> {
-    fn get_peer_ids(&self) -> Vec<PeerId> {
-        self.get_peers_ids_iter().copied().collect()
+impl TaskP2PService for FuelP2PService {
+    fn update_metrics<T>(&self, update_fn: T)
+    where
+        T: FnOnce(),
+    {
+        FuelP2PService::update_metrics(self, update_fn)
     }
 
     fn get_all_peer_info(&self) -> Vec<(&PeerId, &PeerInfo)> {
@@ -184,24 +295,34 @@ impl TaskP2PService for FuelP2PService<PostcardCodec> {
         &mut self,
         message: GossipsubBroadcastRequest,
     ) -> anyhow::Result<()> {
-        self.publish_message(message)?;
-        Ok(())
+        let result = self.publish_message(message);
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if matches!(&e, PublishError::InsufficientPeers) {
+                    Ok(())
+                } else {
+                    Err(anyhow!(e))
+                }
+            }
+        }
     }
 
     fn send_request_msg(
         &mut self,
         peer_id: Option<PeerId>,
         request_msg: RequestMessage,
-        channel_item: ResponseChannelItem,
+        on_response: ResponseSender,
     ) -> anyhow::Result<()> {
-        self.send_request_msg(peer_id, request_msg, channel_item)?;
+        self.send_request_msg(peer_id, request_msg, on_response)?;
         Ok(())
     }
 
     fn send_response_msg(
         &mut self,
-        request_id: RequestId,
-        message: OutboundResponse,
+        request_id: InboundRequestId,
+        message: V2ResponseMessage,
     ) -> anyhow::Result<()> {
         self.send_response_msg(request_id, message)?;
         Ok(())
@@ -246,6 +367,8 @@ pub trait Broadcast: Send {
     ) -> anyhow::Result<()>;
 
     fn tx_broadcast(&self, transaction: TransactionGossipData) -> anyhow::Result<()>;
+
+    fn new_tx_subscription_broadcast(&self, peer_id: FuelPeerId) -> anyhow::Result<()>;
 }
 
 impl Broadcast for SharedState {
@@ -270,86 +393,92 @@ impl Broadcast for SharedState {
         self.tx_broadcast.send(transaction)?;
         Ok(())
     }
+
+    fn new_tx_subscription_broadcast(&self, peer_id: FuelPeerId) -> anyhow::Result<()> {
+        self.new_tx_subscription_broadcast.send(peer_id)?;
+        Ok(())
+    }
 }
 
-/// Orchestrates various p2p-related events between the inner `P2pService`
-/// and the top level `NetworkService`.
-pub struct Task<P, D, B> {
-    p2p_service: P,
-    db: Arc<D>,
+/// Uninitialized task for the p2p that can be upgraded later into [`Task`].
+pub struct UninitializedTask<V, B, T> {
+    chain_id: ChainId,
+    last_height: BlockHeight,
+    view_provider: V,
     next_block_height: BoxStream<BlockHeight>,
     /// Receive internal Task Requests
     request_receiver: mpsc::Receiver<TaskRequest>,
     broadcast: B,
-    max_headers_per_request: u32,
+    tx_pool: T,
+    config: Config<NotInitialized>,
+}
+
+/// Orchestrates various p2p-related events between the inner `P2pService`
+/// and the top level `NetworkService`.
+pub struct Task<P, V, B, T> {
+    chain_id: ChainId,
+    response_timeout: Duration,
+    p2p_service: P,
+    view_provider: V,
+    next_block_height: BoxStream<BlockHeight>,
+    /// Receive internal Task Requests
+    request_receiver: mpsc::Receiver<TaskRequest>,
+    request_sender: mpsc::Sender<TaskRequest>,
+    db_heavy_task_processor: SyncProcessor,
+    tx_pool_heavy_task_processor: AsyncProcessor,
+    broadcast: B,
+    tx_pool: T,
+    max_headers_per_request: usize,
+    max_txs_per_request: usize,
     // milliseconds wait time between peer heartbeat reputation checks
     heartbeat_check_interval: Duration,
     heartbeat_max_avg_interval: Duration,
     heartbeat_max_time_since_last: Duration,
     next_check_time: Instant,
     heartbeat_peer_reputation_config: HeartbeatPeerReputationConfig,
+    // cached view
+    cached_view: Arc<CachedView>,
 }
 
-#[derive(Clone)]
+#[derive(Default, Clone)]
 pub struct HeartbeatPeerReputationConfig {
     old_heartbeat_penalty: AppScore,
     low_heartbeat_frequency_penalty: AppScore,
 }
 
-impl<D> Task<FuelP2PService<PostcardCodec>, D, SharedState> {
+impl<V, T> UninitializedTask<V, SharedState, T> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new<B: BlockHeightImporter>(
-        config: Config,
-        db: Arc<D>,
-        block_importer: Arc<B>,
+        chain_id: ChainId,
+        last_height: BlockHeight,
+        config: Config<NotInitialized>,
+        shared_state: SharedState,
+        request_receiver: Receiver<TaskRequest>,
+        view_provider: V,
+        block_importer: B,
+        tx_pool: T,
     ) -> Self {
-        let Config {
-            max_block_size,
-            max_headers_per_request,
-            heartbeat_check_interval,
-            heartbeat_max_avg_interval,
-            heartbeat_max_time_since_last,
-            ..
-        } = config;
-        let (request_sender, request_receiver) = mpsc::channel(100);
-        let (tx_broadcast, _) = broadcast::channel(100);
-        let (block_height_broadcast, _) = broadcast::channel(100);
-
-        // Hardcoded for now, but left here to be configurable in the future.
-        // TODO: https://github.com/FuelLabs/fuel-core/issues/1340
-        let heartbeat_peer_reputation_config = HeartbeatPeerReputationConfig {
-            old_heartbeat_penalty: -5.,
-            low_heartbeat_frequency_penalty: -5.,
-        };
-
         let next_block_height = block_importer.next_block_height();
-        let p2p_service = FuelP2PService::new(config, PostcardCodec::new(max_block_size));
-
-        let reserved_peers_broadcast =
-            p2p_service.peer_manager().reserved_peers_updates();
-
-        let next_check_time = Instant::now() + heartbeat_check_interval;
 
         Self {
-            p2p_service,
-            db,
-            request_receiver,
+            chain_id,
+            last_height,
+            view_provider,
+            tx_pool,
             next_block_height,
-            broadcast: SharedState {
-                request_sender,
-                tx_broadcast,
-                reserved_peers_broadcast,
-                block_height_broadcast,
-            },
-            max_headers_per_request,
-            heartbeat_check_interval,
-            heartbeat_max_avg_interval,
-            heartbeat_max_time_since_last,
-            next_check_time,
-            heartbeat_peer_reputation_config,
+            request_receiver,
+            broadcast: shared_state,
+            config,
         }
     }
 }
-impl<P: TaskP2PService, D, B: Broadcast> Task<P, D, B> {
+
+impl<P, V, B, T> Task<P, V, B, T>
+where
+    P: TaskP2PService,
+    V: AtomicView,
+    B: Broadcast,
+{
     fn peer_heartbeat_reputation_checks(&self) -> anyhow::Result<()> {
         for (peer_id, peer_info) in self.p2p_service.get_all_peer_info() {
             if peer_info.heartbeat_data.duration_since_last_heartbeat()
@@ -392,20 +521,260 @@ impl<P: TaskP2PService, D, B: Broadcast> Task<P, D, B> {
     }
 }
 
+impl<P, V, B, T> Task<P, V, B, T>
+where
+    P: TaskP2PService + 'static,
+    V: AtomicView + 'static,
+    V::LatestView: P2pDb,
+    T: TxPool + 'static,
+    B: Send,
+{
+    fn update_metrics<U>(&self, update_fn: U)
+    where
+        U: FnOnce(),
+    {
+        self.p2p_service.update_metrics(update_fn)
+    }
+
+    fn process_request(
+        &mut self,
+        request_message: RequestMessage,
+        request_id: InboundRequestId,
+    ) -> anyhow::Result<()> {
+        match request_message {
+            RequestMessage::Transactions(range) => {
+                self.handle_transactions_request(range, request_id)
+            }
+            RequestMessage::SealedHeaders(range) => {
+                self.handle_sealed_headers_request(range, request_id)
+            }
+            RequestMessage::TxPoolAllTransactionsIds => {
+                self.handle_all_transactions_ids_request(request_id)
+            }
+            RequestMessage::TxPoolFullTransactions(tx_ids) => {
+                self.handle_full_transactions_request(tx_ids, request_id)
+            }
+        }
+    }
+
+    fn handle_db_request<DbLookUpFn, ResponseSenderFn, TaskRequestFn, R>(
+        &mut self,
+        range: Range<u32>,
+        request_id: InboundRequestId,
+        response_sender: ResponseSenderFn,
+        db_lookup: DbLookUpFn,
+        task_request: TaskRequestFn,
+        max_len: usize,
+    ) -> anyhow::Result<()>
+    where
+        DbLookUpFn: Fn(&V::LatestView, &Arc<CachedView>, Range<u32>) -> anyhow::Result<Option<R>>
+            + Send
+            + 'static,
+        ResponseSenderFn:
+            Fn(Result<R, ResponseMessageErrorCode>) -> V2ResponseMessage + Send + 'static,
+        TaskRequestFn: Fn(Result<R, ResponseMessageErrorCode>, InboundRequestId) -> TaskRequest
+            + Send
+            + 'static,
+        R: Send + 'static,
+    {
+        let instant = Instant::now();
+        let timeout = self.response_timeout;
+        let response_channel = self.request_sender.clone();
+        let range_len = range.len();
+
+        self.update_metrics(|| set_blocks_requested(range_len));
+
+        if range_len > max_len {
+            tracing::error!(
+                requested_length = range.len(),
+                max_len,
+                "Requested range is too large"
+            );
+            let response = Err(ResponseMessageErrorCode::RequestedRangeTooLarge);
+            let _ = self
+                .p2p_service
+                .send_response_msg(request_id, response_sender(response));
+            return Ok(());
+        }
+
+        let view = self.view_provider.latest_view()?;
+        let result = self.db_heavy_task_processor.try_spawn({
+            let cached_view = self.cached_view.clone();
+            move || {
+                if instant.elapsed() > timeout {
+                    tracing::warn!("Request timed out");
+                    return;
+                }
+
+                let response = db_lookup(&view, &cached_view, range.clone())
+                    .ok()
+                    .flatten()
+                    .ok_or(ResponseMessageErrorCode::Timeout);
+
+                let _ = response_channel
+                    .try_send(task_request(response, request_id))
+                    .trace_err("Failed to send response to the request channel");
+            }
+        });
+
+        if result.is_err() {
+            let err = Err(ResponseMessageErrorCode::SyncProcessorOutOfCapacity);
+            let _ = self
+                .p2p_service
+                .send_response_msg(request_id, response_sender(err));
+        }
+
+        Ok(())
+    }
+
+    fn handle_transactions_request(
+        &mut self,
+        range: Range<u32>,
+        request_id: InboundRequestId,
+    ) -> anyhow::Result<()> {
+        self.handle_db_request(
+            range,
+            request_id,
+            V2ResponseMessage::Transactions,
+            |view, cached_view, range| {
+                cached_view
+                    .get_transactions(view, range)
+                    .map_err(anyhow::Error::from)
+            },
+            |response, request_id| TaskRequest::DatabaseTransactionsLookUp {
+                response,
+                request_id,
+            },
+            self.max_headers_per_request,
+        )
+    }
+
+    fn handle_sealed_headers_request(
+        &mut self,
+        range: Range<u32>,
+        request_id: InboundRequestId,
+    ) -> anyhow::Result<()> {
+        self.handle_db_request(
+            range,
+            request_id,
+            V2ResponseMessage::SealedHeaders,
+            |view, cached_view, range| {
+                cached_view
+                    .get_sealed_headers(view, range)
+                    .map_err(anyhow::Error::from)
+            },
+            |response, request_id| TaskRequest::DatabaseHeaderLookUp {
+                response,
+                request_id,
+            },
+            self.max_headers_per_request,
+        )
+    }
+
+    fn handle_txpool_request<F, ResponseSenderFn, TaskRequestFn, R>(
+        &mut self,
+        request_id: InboundRequestId,
+        txpool_function: F,
+        response_sender: ResponseSenderFn,
+        task_request: TaskRequestFn,
+    ) -> anyhow::Result<()>
+    where
+        ResponseSenderFn:
+            Fn(Result<R, ResponseMessageErrorCode>) -> V2ResponseMessage + Send + 'static,
+        TaskRequestFn: Fn(Result<R, ResponseMessageErrorCode>, InboundRequestId) -> TaskRequest
+            + Send
+            + 'static,
+        F: Future<Output = anyhow::Result<R>> + Send + 'static,
+    {
+        let instant = Instant::now();
+        let timeout = self.response_timeout;
+        let response_channel = self.request_sender.clone();
+        let result = self.tx_pool_heavy_task_processor.try_spawn(async move {
+            if instant.elapsed() > timeout {
+                tracing::warn!("Request timed out");
+                return;
+            }
+
+            let Ok(response) = txpool_function.await else {
+                warn!("Failed to get txpool data");
+                return;
+            };
+
+            let _ = response_channel
+                .try_send(task_request(Ok(response), request_id))
+                .trace_err("Failed to send response to the request channel");
+        });
+
+        if result.is_err() {
+            let res = Err(ResponseMessageErrorCode::SyncProcessorOutOfCapacity);
+            let _ = self
+                .p2p_service
+                .send_response_msg(request_id, response_sender(res));
+        }
+
+        Ok(())
+    }
+
+    fn handle_all_transactions_ids_request(
+        &mut self,
+        request_id: InboundRequestId,
+    ) -> anyhow::Result<()> {
+        let max_txs = self.max_txs_per_request;
+        let tx_pool = self.tx_pool.clone();
+        self.handle_txpool_request(
+            request_id,
+            async move { tx_pool.get_tx_ids(max_txs).await },
+            V2ResponseMessage::TxPoolAllTransactionsIds,
+            |response, request_id| TaskRequest::TxPoolAllTransactionsIds {
+                response,
+                request_id,
+            },
+        )
+    }
+
+    fn handle_full_transactions_request(
+        &mut self,
+        tx_ids: Vec<TxId>,
+        request_id: InboundRequestId,
+    ) -> anyhow::Result<()> {
+        if tx_ids.len() > self.max_txs_per_request {
+            self.p2p_service.send_response_msg(
+                request_id,
+                V2ResponseMessage::TxPoolFullTransactions(Err(
+                    ResponseMessageErrorCode::RequestedRangeTooLarge,
+                )),
+            )?;
+            return Ok(());
+        }
+        let tx_pool = self.tx_pool.clone();
+        self.handle_txpool_request(
+            request_id,
+            async move { tx_pool.get_full_txs(tx_ids).await },
+            V2ResponseMessage::TxPoolFullTransactions,
+            |response, request_id| TaskRequest::TxPoolFullTransactions {
+                response,
+                request_id,
+            },
+        )
+    }
+}
+
 fn convert_peer_id(peer_id: &PeerId) -> anyhow::Result<FuelPeerId> {
-    let inner = Vec::try_from(*peer_id)?;
+    let inner = Vec::from(*peer_id);
     Ok(FuelPeerId::from(inner))
 }
 
 #[async_trait::async_trait]
-impl<D> RunnableService for Task<FuelP2PService<PostcardCodec>, D, SharedState>
+impl<V, T> RunnableService for UninitializedTask<V, SharedState, T>
 where
-    Self: RunnableTask,
+    V: AtomicView + 'static,
+    V::LatestView: P2pDb,
+    T: TxPool + 'static,
 {
     const NAME: &'static str = "P2P";
 
     type SharedData = SharedState;
-    type Task = Task<FuelP2PService<PostcardCodec>, D, SharedState>;
+    type Task = Task<FuelP2PService, V, SharedState, T>;
     type TaskParams = ();
 
     fn shared_data(&self) -> Self::SharedData {
@@ -417,94 +786,196 @@ where
         _: &StateWatcher,
         _: Self::TaskParams,
     ) -> anyhow::Result<Self::Task> {
-        self.p2p_service.start().await?;
-        Ok(self)
+        let Self {
+            chain_id,
+            last_height,
+            view_provider,
+            next_block_height,
+            request_receiver,
+            broadcast,
+            tx_pool,
+            config,
+        } = self;
+
+        let view = view_provider.latest_view()?;
+        let genesis = view.get_genesis()?;
+        let config = config.init(genesis)?;
+        let Config {
+            max_block_size,
+            max_headers_per_request,
+            max_txs_per_request,
+            heartbeat_check_interval,
+            heartbeat_max_avg_interval,
+            heartbeat_max_time_since_last,
+            database_read_threads,
+            tx_pool_threads,
+            metrics,
+            ..
+        } = config;
+
+        // Hardcoded for now, but left here to be configurable in the future.
+        // TODO: https://github.com/FuelLabs/fuel-core/issues/1340
+        let heartbeat_peer_reputation_config = HeartbeatPeerReputationConfig {
+            old_heartbeat_penalty: -5.,
+            low_heartbeat_frequency_penalty: -5.,
+        };
+
+        let response_timeout = config.set_request_timeout;
+        let mut p2p_service = FuelP2PService::new(
+            broadcast.reserved_peers_broadcast.clone(),
+            config,
+            PostcardCodec::new(max_block_size),
+        )
+        .await?;
+        p2p_service.update_block_height(last_height);
+        p2p_service.start().await?;
+
+        let next_check_time =
+            Instant::now().checked_add(heartbeat_check_interval).expect(
+                "The heartbeat check interval should be small enough to do frequently",
+            );
+        let db_heavy_task_processor = SyncProcessor::new(
+            "P2P_DatabaseProcessor",
+            database_read_threads,
+            1024 * 10,
+        )?;
+        let tx_pool_heavy_task_processor =
+            AsyncProcessor::new("P2P_TxPoolLookUpProcessor", tx_pool_threads, 32)?;
+        let request_sender = broadcast.request_sender.clone();
+
+        let task = Task {
+            chain_id,
+            response_timeout,
+            p2p_service,
+            view_provider,
+            request_receiver,
+            request_sender,
+            next_block_height,
+            broadcast,
+            tx_pool,
+            db_heavy_task_processor,
+            tx_pool_heavy_task_processor,
+            max_headers_per_request,
+            max_txs_per_request,
+            heartbeat_check_interval,
+            heartbeat_max_avg_interval,
+            heartbeat_max_time_since_last,
+            next_check_time,
+            heartbeat_peer_reputation_config,
+            cached_view: Arc::new(CachedView::new(614 * 10, metrics)),
+        };
+        Ok(task)
     }
 }
 
 // TODO: Add tests https://github.com/FuelLabs/fuel-core/issues/1275
 #[async_trait::async_trait]
-impl<P, D, B> RunnableTask for Task<P, D, B>
+impl<P, V, B, T> RunnableTask for Task<P, V, B, T>
 where
     P: TaskP2PService + 'static,
-    D: P2pDb + 'static,
+    V: AtomicView + 'static,
+    V::LatestView: P2pDb,
     B: Broadcast + 'static,
+    T: TxPool + 'static,
 {
-    async fn run(&mut self, watcher: &mut StateWatcher) -> anyhow::Result<bool> {
-        tracing::debug!("P2P task is running");
-        let should_continue;
-
+    async fn run(&mut self, watcher: &mut StateWatcher) -> TaskNextAction {
         tokio::select! {
             biased;
 
             _ = watcher.while_started() => {
-                should_continue = false;
-            }
-
+                TaskNextAction::Stop
+            },
+            latest_block_height = self.next_block_height.next() => {
+                if let Some(latest_block_height) = latest_block_height {
+                    let _ = self.p2p_service.update_block_height(latest_block_height);
+                    TaskNextAction::Continue
+                } else {
+                    TaskNextAction::Stop
+                }
+            },
             next_service_request = self.request_receiver.recv() => {
-                should_continue = true;
                 match next_service_request {
                     Some(TaskRequest::BroadcastTransaction(transaction)) => {
+                        let tx_id = transaction.id(&self.chain_id);
                         let broadcast = GossipsubBroadcastRequest::NewTx(transaction);
                         let result = self.p2p_service.publish_message(broadcast);
                         if let Err(e) = result {
-                            tracing::error!("Got an error during transaction broadcasting {}", e);
+                            tracing::error!("Got an error during transaction {} broadcasting {}", tx_id, e);
                         }
                     }
-                    Some(TaskRequest::BroadcastBlock(block)) => {
-                        let broadcast = GossipsubBroadcastRequest::NewBlock(block);
-                        let result = self.p2p_service.publish_message(broadcast);
-                        if let Err(e) = result {
-                            tracing::error!("Got an error during block broadcasting {}", e);
-                        }
-                    }
-                    Some(TaskRequest::BroadcastVote(vote)) => {
-                        let broadcast = GossipsubBroadcastRequest::ConsensusVote(vote);
-                        let result = self.p2p_service.publish_message(broadcast);
-                        if let Err(e) = result {
-                            tracing::error!("Got an error during vote broadcasting {}", e);
-                        }
-                    }
-                    Some(TaskRequest::GetPeerIds(channel)) => {
-                        let peer_ids = self.p2p_service.get_peer_ids();
-                        let _ = channel.send(peer_ids);
-                    }
-                    Some(TaskRequest::GetBlock { height, channel }) => {
-                        let request_msg = RequestMessage::Block(height);
-                        let channel_item = ResponseChannelItem::Block(channel);
-                        let peer = self.p2p_service.get_peer_id_with_height(&height);
-                        let _ = self.p2p_service.send_request_msg(peer, request_msg, channel_item);
-                    }
-                    Some(TaskRequest::GetSealedHeaders { block_height_range, channel: response}) => {
-                        let request_msg = RequestMessage::SealedHeaders(block_height_range.clone());
-                        let channel_item = ResponseChannelItem::SealedHeaders(response);
-
-                        // Note: this range has already been check for
+                    Some(TaskRequest::GetSealedHeaders { block_height_range, channel}) => {
+                        // Note: this range has already been checked for
                         // validity in `SharedState::get_sealed_block_headers`.
-                        let block_height = BlockHeight::from(block_height_range.end - 1);
-                        let peer = self.p2p_service
-                             .get_peer_id_with_height(&block_height);
-                        let _ = self.p2p_service.send_request_msg(peer, request_msg, channel_item);
+                        let height = BlockHeight::from(block_height_range.end.saturating_sub(1));
+                        let Some(peer) = self.p2p_service.get_peer_id_with_height(&height) else {
+                            let _ = channel.send(Err(TaskError::NoPeerFound));
+                            return TaskNextAction::Continue
+                        };
+                        let channel = ResponseSender::SealedHeaders(channel);
+                        let request_msg = RequestMessage::SealedHeaders(block_height_range.clone());
+                        self.p2p_service.send_request_msg(Some(peer), request_msg, channel).expect("We always have a peer here, so send has a target");
                     }
-                    Some(TaskRequest::GetTransactions { block_height_range, from_peer, channel }) => {
+                    Some(TaskRequest::GetTransactions {block_height_range, channel }) => {
+                        let height = BlockHeight::from(block_height_range.end.saturating_sub(1));
+                        let Some(peer) = self.p2p_service.get_peer_id_with_height(&height) else {
+                            let _ = channel.send(Err(TaskError::NoPeerFound));
+                            return TaskNextAction::Continue
+                        };
+                        let channel = ResponseSender::Transactions(channel);
+                        let request_msg = RequestMessage::Transactions(block_height_range.clone());
+                        self.p2p_service.send_request_msg(Some(peer), request_msg, channel).expect("We always have a peer here, so send has a target");
+                    }
+                    Some(TaskRequest::GetTransactionsFromPeer { block_height_range, from_peer, channel }) => {
+                        let channel = ResponseSender::TransactionsFromPeer(channel);
                         let request_msg = RequestMessage::Transactions(block_height_range);
-                        let channel_item = ResponseChannelItem::Transactions(channel);
-                        let _ = self.p2p_service.send_request_msg(Some(from_peer), request_msg, channel_item);
+                        self.p2p_service.send_request_msg(Some(from_peer), request_msg, channel).expect("We always a peer here, so send has a target");
+                    }
+                    Some(TaskRequest::TxPoolGetAllTxIds { from_peer, channel }) => {
+                        let channel = ResponseSender::TxPoolAllTransactionsIds(channel);
+                        let request_msg = RequestMessage::TxPoolAllTransactionsIds;
+                        self.p2p_service.send_request_msg(Some(from_peer), request_msg, channel).expect("We always have a peer here, so send has a target");
+                    }
+                    Some(TaskRequest::TxPoolGetFullTransactions { tx_ids, from_peer, channel }) => {
+                        let channel = ResponseSender::TxPoolFullTransactions(channel);
+                        let request_msg = RequestMessage::TxPoolFullTransactions(tx_ids);
+                        self.p2p_service.send_request_msg(Some(from_peer), request_msg, channel).expect("We always have a peer here, so send has a target");
                     }
                     Some(TaskRequest::RespondWithGossipsubMessageReport((message, acceptance))) => {
-                        // report_message(&mut self.p2p_service, message, acceptance);
-                        self.p2p_service.report_message(message, acceptance)?;
+                        let res = self.p2p_service.report_message(message, acceptance);
+                        if let Err(err) = res {
+                            return TaskNextAction::ErrorContinue(err)
+                        }
                     }
                     Some(TaskRequest::RespondWithPeerReport { peer_id, score, reporting_service }) => {
                         let _ = self.p2p_service.report_peer(peer_id, score, reporting_service);
                     }
+                    Some(TaskRequest::GetAllPeerInfo { channel }) => {
+                        let peers = self.p2p_service.get_all_peer_info()
+                            .into_iter()
+                            .map(|(id, info)| (*id, info.clone()))
+                            .collect::<Vec<_>>();
+                        let _ = channel.send(peers);
+                    }
+                    Some(TaskRequest::DatabaseTransactionsLookUp { response, request_id }) => {
+                        let _ = self.p2p_service.send_response_msg(request_id, V2ResponseMessage::Transactions(response));
+                    }
+                    Some(TaskRequest::DatabaseHeaderLookUp { response, request_id }) => {
+                        let _ = self.p2p_service.send_response_msg(request_id, V2ResponseMessage::SealedHeaders(response));
+                    }
+                    Some(TaskRequest::TxPoolAllTransactionsIds { response, request_id }) => {
+                        let _ = self.p2p_service.send_response_msg(request_id, V2ResponseMessage::TxPoolAllTransactionsIds(response));
+                    }
+                    Some(TaskRequest::TxPoolFullTransactions { response, request_id }) => {
+                        let _ = self.p2p_service.send_response_msg(request_id, V2ResponseMessage::TxPoolFullTransactions(response));
+                    }
                     None => {
-                        unreachable!("The `Task` is holder of the `Sender`, so it should not be possible");
+                        tracing::error!("The P2P `Task` should be holder of the `Sender`");
+                        return TaskNextAction::Stop
                     }
                 }
+                    TaskNextAction::Continue
             }
             p2p_event = self.p2p_service.next_event() => {
-                should_continue = true;
                 match p2p_event {
                     Some(FuelP2PEvent::PeerInfoUpdated { peer_id, block_height }) => {
                         let peer_id: Vec<u8> = peer_id.into();
@@ -523,75 +994,24 @@ where
                                 let next_transaction = GossipData::new(transaction, peer_id, message_id);
                                 let _ = self.broadcast.tx_broadcast(next_transaction);
                             },
-                            GossipsubMessage::NewBlock(block) => {
-                                // todo: add logic to gossip newly received blocks
-                                let _new_block = GossipData::new(block, peer_id, message_id);
-                            },
-                            GossipsubMessage::ConsensusVote(vote) => {
-                                // todo: add logic to gossip newly received votes
-                                let _new_vote = GossipData::new(vote, peer_id, message_id);
-                            },
                         }
                     },
-                    Some(FuelP2PEvent::RequestMessage { request_message, request_id }) => {
-                        match request_message {
-                            RequestMessage::Block(block_height) => {
-                                match self.db.get_sealed_block(&block_height) {
-                                    Ok(maybe_block) => {
-                                        let response = maybe_block.map(Arc::new);
-                                        let _ = self.p2p_service.send_response_msg(request_id, OutboundResponse::Block(response));
-                                    },
-                                    Err(e) => {
-                                        tracing::error!("Failed to get block at height {:?}: {:?}", block_height, e);
-                                        let response = None;
-                                        let _ = self.p2p_service.send_response_msg(request_id, OutboundResponse::Block(response));
-                                        return Err(e.into())
-                                    }
-                                }
-                            }
-                            RequestMessage::Transactions(range) => {
-                                match self.db.get_transactions(range.clone()) {
-                                    Ok(maybe_transactions) => {
-                                        let response = maybe_transactions.map(Arc::new);
-                                        let _ = self.p2p_service.send_response_msg(request_id, OutboundResponse::Transactions(response));
-                                    },
-                                    Err(e) => {
-                                        tracing::error!("Failed to get transactions for range {:?}: {:?}", range, e);
-                                        let response = None;
-                                        let _ = self.p2p_service.send_response_msg(request_id, OutboundResponse::Transactions(response));
-                                        return Err(e.into())
-                                    }
-                                }
-                            }
-                            RequestMessage::SealedHeaders(range) => {
-                                let max_len = self.max_headers_per_request.try_into().expect("u32 should always fit into usize");
-                                if range.len() > max_len {
-                                    tracing::error!("Requested range of sealed headers is too big. Requested length: {:?}, Max length: {:?}", range.len(), max_len);
-                                    // TODO: Return helpful error message to requester. https://github.com/FuelLabs/fuel-core/issues/1311
-                                    let response = None;
-                                    let _ = self.p2p_service.send_response_msg(request_id, OutboundResponse::SealedHeaders(response));
-                                } else {
-                                    match self.db.get_sealed_headers(range.clone()) {
-                                        Ok(headers) => {
-                                            let response = Some(headers);
-                                            let _ = self.p2p_service.send_response_msg(request_id, OutboundResponse::SealedHeaders(response));
-                                        },
-                                        Err(e) => {
-                                            tracing::error!("Failed to get sealed headers for range {:?}: {:?}", range, &e);
-                                            let response = None;
-                                            let _ = self.p2p_service.send_response_msg(request_id, OutboundResponse::SealedHeaders(response));
-                                            return Err(e.into())
-                                        }
-                                    }
-                                };
-                            }
+                    Some(FuelP2PEvent::InboundRequestMessage { request_message, request_id }) => {
+                        let res = self.process_request(request_message, request_id);
+                        if let Err(err) = res {
+                            return TaskNextAction::ErrorContinue(err)
+                        }
+                    },
+                    Some(FuelP2PEvent::NewSubscription { peer_id, tag }) => {
+                        if tag == GossipTopicTag::NewTx {
+                            let _ = self.broadcast.new_tx_subscription_broadcast(FuelPeerId::from(peer_id.to_bytes()));
                         }
                     },
                     _ => (),
                 }
+                TaskNextAction::Continue
             },
             _  = tokio::time::sleep_until(self.next_check_time) => {
-                should_continue = true;
                 let res = self.peer_heartbeat_reputation_checks();
                 match res {
                     Ok(_) => tracing::debug!("Peer heartbeat reputation checks completed"),
@@ -600,19 +1020,9 @@ where
                     }
                 }
                 self.next_check_time += self.heartbeat_check_interval;
-            },
-            latest_block_height = self.next_block_height.next() => {
-                if let Some(latest_block_height) = latest_block_height {
-                    let _ = self.p2p_service.update_block_height(latest_block_height);
-                    should_continue = true;
-                } else {
-                    should_continue = false;
-                }
+                TaskNextAction::Continue
             }
         }
-
-        tracing::debug!("P2P task is finished");
-        Ok(should_continue)
     }
 
     async fn shutdown(self) -> anyhow::Result<()> {
@@ -629,14 +1039,18 @@ where
 
 #[derive(Clone)]
 pub struct SharedState {
+    /// Sender of p2p with peer gossip subscription (`Vec<u8>` represent the peer_id)
+    new_tx_subscription_broadcast: broadcast::Sender<FuelPeerId>,
     /// Sender of p2p transaction used for subscribing.
     tx_broadcast: broadcast::Sender<TransactionGossipData>,
     /// Sender of reserved peers connection updates.
     reserved_peers_broadcast: broadcast::Sender<usize>,
     /// Used for communicating with the `Task`.
     request_sender: mpsc::Sender<TaskRequest>,
-    /// Sender of p2p blopck height data
+    /// Sender of p2p block height data
     block_height_broadcast: broadcast::Sender<BlockHeightHeartbeatData>,
+    /// Max txs per request
+    max_txs_per_request: usize,
 }
 
 impl SharedState {
@@ -653,22 +1067,6 @@ impl SharedState {
         Ok(())
     }
 
-    pub async fn get_block(
-        &self,
-        height: BlockHeight,
-    ) -> anyhow::Result<Option<SealedBlock>> {
-        let (sender, receiver) = oneshot::channel();
-
-        self.request_sender
-            .send(TaskRequest::GetBlock {
-                height,
-                channel: sender,
-            })
-            .await?;
-
-        receiver.await.map_err(|e| anyhow!("{}", e))
-    }
-
     pub async fn get_sealed_block_headers(
         &self,
         block_height_range: Range<u32>,
@@ -678,7 +1076,7 @@ impl SharedState {
         if block_height_range.is_empty() {
             return Err(anyhow!(
                 "Cannot retrieve headers for an empty range of block heights"
-            ))
+            ));
         }
 
         self.request_sender
@@ -688,42 +1086,163 @@ impl SharedState {
             })
             .await?;
 
-        receiver
+        let (peer_id, response) = receiver
             .await
-            .map(|(peer_id, headers)| (peer_id.to_bytes(), headers))
-            .map_err(|e| anyhow!("{}", e))
+            .map_err(|e| anyhow!("{e}"))?
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let data = response.map_err(|e| anyhow!("Invalid response from peer {e:?}"))?;
+        if let Err(ref response_error_code) = data {
+            warn!(
+                "Peer {peer_id:?} failed to respond with sealed headers: {response_error_code:?}"
+            );
+        };
+
+        Ok((peer_id.to_bytes(), data.ok()))
+    }
+
+    pub async fn get_transactions(
+        &self,
+        range: Range<u32>,
+    ) -> anyhow::Result<(Vec<u8>, Option<Vec<Transactions>>)> {
+        let (sender, receiver) = oneshot::channel();
+
+        if range.is_empty() {
+            return Err(anyhow!(
+                "Cannot retrieve transactions for an empty range of block heights"
+            ));
+        }
+
+        self.request_sender
+            .send(TaskRequest::GetTransactions {
+                block_height_range: range,
+                channel: sender,
+            })
+            .await?;
+
+        let (peer_id, response) = receiver
+            .await
+            .map_err(|e| anyhow!("{e}"))?
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let data = match response {
+            Err(request_response_protocol_error) => Err(anyhow!(
+                "Invalid response from peer {request_response_protocol_error:?}"
+            )),
+            Ok(Err(response_error_code)) => {
+                warn!("Peer {peer_id:?} failed to respond with sealed headers: {response_error_code:?}");
+                Ok(None)
+            }
+            Ok(Ok(headers)) => Ok(Some(headers)),
+        };
+        data.map(|data| (peer_id.to_bytes(), data))
     }
 
     pub async fn get_transactions_from_peer(
         &self,
-        peer_id: Vec<u8>,
+        peer_id: FuelPeerId,
         range: Range<u32>,
     ) -> anyhow::Result<Option<Vec<Transactions>>> {
         let (sender, receiver) = oneshot::channel();
-        let from_peer = PeerId::from_bytes(&peer_id).expect("Valid PeerId");
+        let from_peer = PeerId::from_bytes(peer_id.as_ref()).expect("Valid PeerId");
 
-        let request = TaskRequest::GetTransactions {
+        let request = TaskRequest::GetTransactionsFromPeer {
             block_height_range: range,
             from_peer,
             channel: sender,
         };
         self.request_sender.send(request).await?;
 
-        receiver.await.map_err(|e| anyhow!("{}", e))
+        let (response_from_peer, response) =
+            receiver.await.map_err(|e| anyhow!("{e}"))?;
+        assert_eq!(
+            peer_id.as_ref(),
+            response_from_peer.to_bytes(),
+            "Bug: response from non-requested peer"
+        );
+
+        match response {
+            Err(request_response_protocol_error) => Err(anyhow!(
+                "Invalid response from peer {request_response_protocol_error:?}"
+            )),
+            Ok(Err(response_error_code)) => {
+                warn!(
+                    "Peer {peer_id:?} failed to respond with transactions: {response_error_code:?}"
+                );
+                Ok(None)
+            }
+            Ok(Ok(txs)) => Ok(Some(txs)),
+        }
     }
 
-    pub fn broadcast_vote(&self, vote: Arc<ConsensusVote>) -> anyhow::Result<()> {
-        self.request_sender
-            .try_send(TaskRequest::BroadcastVote(vote))?;
+    pub async fn get_all_transactions_ids_from_peer(
+        &self,
+        peer_id: FuelPeerId,
+    ) -> anyhow::Result<Vec<TxId>> {
+        let (sender, receiver) = oneshot::channel();
+        let from_peer = PeerId::from_bytes(peer_id.as_ref()).expect("Valid PeerId");
+        let request = TaskRequest::TxPoolGetAllTxIds {
+            from_peer,
+            channel: sender,
+        };
+        self.request_sender.try_send(request)?;
 
-        Ok(())
+        let (response_from_peer, response) =
+            receiver.await.map_err(|e| anyhow!("{e}"))?;
+
+        debug_assert_eq!(
+            peer_id.as_ref(),
+            response_from_peer.to_bytes(),
+            "Bug: response from non-requested peer"
+        );
+
+        let response =
+            response.map_err(|e| anyhow!("Invalid response from peer {e:?}"))?;
+
+        let txs = response.inspect_err(|e| { warn!("Peer {peer_id:?} could not response to request to get all transactions ids: {e:?}"); } ).unwrap_or_default();
+
+        if txs.len() > self.max_txs_per_request {
+            return Err(anyhow!("Too many transactions requested: {}", txs.len()));
+        }
+        Ok(txs)
     }
 
-    pub fn broadcast_block(&self, block: Arc<Block>) -> anyhow::Result<()> {
-        self.request_sender
-            .try_send(TaskRequest::BroadcastBlock(block))?;
+    pub async fn get_full_transactions_from_peer(
+        &self,
+        peer_id: FuelPeerId,
+        tx_ids: Vec<TxId>,
+    ) -> anyhow::Result<Vec<Option<Transaction>>> {
+        let (sender, receiver) = oneshot::channel();
+        let from_peer = PeerId::from_bytes(peer_id.as_ref()).expect("Valid PeerId");
+        let request = TaskRequest::TxPoolGetFullTransactions {
+            tx_ids,
+            from_peer,
+            channel: sender,
+        };
+        self.request_sender.try_send(request)?;
 
-        Ok(())
+        let (response_from_peer, response) =
+            receiver.await.map_err(|e| anyhow!("{e}"))?;
+        debug_assert_eq!(
+            peer_id.as_ref(),
+            response_from_peer.to_bytes(),
+            "Bug: response from non-requested peer"
+        );
+
+        let response =
+            response.map_err(|e| anyhow!("Invalid response from peer {e:?}"))?;
+        let txs = response.inspect_err(|e| { warn!("Peer {peer_id:?} could not response to request to get full transactions: {e:?}"); } ).unwrap_or_default();
+
+        if txs.len() > self.max_txs_per_request {
+            return Err(anyhow!("Too many transactions requested: {}", txs.len()));
+        }
+        txs.into_iter()
+            .map(|tx| {
+                tx.map(Transaction::try_from)
+                    .transpose()
+                    .map_err(|err| anyhow::anyhow!(err))
+            })
+            .collect()
     }
 
     pub fn broadcast_transaction(
@@ -735,14 +1254,18 @@ impl SharedState {
         Ok(())
     }
 
-    pub async fn get_peer_ids(&self) -> anyhow::Result<Vec<PeerId>> {
+    pub async fn get_all_peers(&self) -> anyhow::Result<Vec<(PeerId, PeerInfo)>> {
         let (sender, receiver) = oneshot::channel();
 
         self.request_sender
-            .send(TaskRequest::GetPeerIds(sender))
+            .send(TaskRequest::GetAllPeerInfo { channel: sender })
             .await?;
 
         receiver.await.map_err(|e| anyhow!("{}", e))
+    }
+
+    pub fn subscribe_new_peers(&self) -> broadcast::Receiver<FuelPeerId> {
+        self.new_tx_subscription_broadcast.subscribe()
     }
 
     pub fn subscribe_tx(&self) -> broadcast::Receiver<TransactionGossipData> {
@@ -786,19 +1309,66 @@ impl SharedState {
     }
 }
 
-pub fn new_service<D, B>(p2p_config: Config, db: D, block_importer: B) -> Service<D>
-where
-    D: P2pDb + 'static,
-    B: BlockHeightImporter,
-{
-    Service::new(Task::new(
-        p2p_config,
-        Arc::new(db),
-        Arc::new(block_importer),
-    ))
+pub fn build_shared_state(
+    config: Config<NotInitialized>,
+) -> (SharedState, Receiver<TaskRequest>) {
+    let (request_sender, request_receiver) = mpsc::channel(CHANNEL_SIZE);
+    let (tx_broadcast, _) = broadcast::channel(CHANNEL_SIZE);
+    let (new_tx_subscription_broadcast, _) = broadcast::channel(CHANNEL_SIZE);
+    let (block_height_broadcast, _) = broadcast::channel(CHANNEL_SIZE);
+
+    let (reserved_peers_broadcast, _) = broadcast::channel::<usize>(
+        config
+            .reserved_nodes
+            .len()
+            .saturating_mul(2)
+            .saturating_add(1),
+    );
+
+    (
+        SharedState {
+            request_sender,
+            new_tx_subscription_broadcast,
+            tx_broadcast,
+            reserved_peers_broadcast,
+            block_height_broadcast,
+            max_txs_per_request: config.max_txs_per_request,
+        },
+        request_receiver,
+    )
 }
 
-pub(crate) fn to_message_acceptance(
+#[allow(clippy::too_many_arguments)]
+pub fn new_service<V, B, T>(
+    chain_id: ChainId,
+    last_height: BlockHeight,
+    p2p_config: Config<NotInitialized>,
+    shared_state: SharedState,
+    request_receiver: Receiver<TaskRequest>,
+    view_provider: V,
+    block_importer: B,
+    tx_pool: T,
+) -> Service<V, T>
+where
+    V: AtomicView + 'static,
+    V::LatestView: P2pDb,
+    B: BlockHeightImporter,
+    T: TxPool,
+{
+    let task = UninitializedTask::new(
+        chain_id,
+        last_height,
+        p2p_config,
+        shared_state,
+        request_receiver,
+        view_provider,
+        block_importer,
+        tx_pool,
+    );
+    Service::new(task)
+}
+
+pub fn to_message_acceptance(
     acceptance: &GossipsubMessageAcceptance,
 ) -> MessageAcceptance {
     match acceptance {
@@ -808,8 +1378,8 @@ pub(crate) fn to_message_acceptance(
     }
 }
 
-fn report_message<T: NetworkCodec>(
-    p2p_service: &mut FuelP2PService<T>,
+fn report_message(
+    p2p_service: &mut FuelP2PService,
     message: GossipsubMessageInfo,
     acceptance: GossipsubMessageAcceptance,
 ) {
@@ -842,32 +1412,32 @@ pub mod tests {
         State,
     };
     use fuel_core_storage::Result as StorageResult;
-    use fuel_core_types::fuel_types::BlockHeight;
+    use fuel_core_types::{
+        blockchain::consensus::Genesis,
+        fuel_types::BlockHeight,
+    };
     use futures::FutureExt;
-    use std::collections::VecDeque;
+    use std::{
+        collections::VecDeque,
+        time::SystemTime,
+    };
 
     #[derive(Clone, Debug)]
     struct FakeDb;
 
+    impl AtomicView for FakeDb {
+        type LatestView = Self;
+
+        fn latest_view(&self) -> StorageResult<Self::LatestView> {
+            Ok(self.clone())
+        }
+    }
+
     impl P2pDb for FakeDb {
-        fn get_sealed_block(
-            &self,
-            _height: &BlockHeight,
-        ) -> StorageResult<Option<SealedBlock>> {
-            unimplemented!()
-        }
-
-        fn get_sealed_header(
-            &self,
-            _height: &BlockHeight,
-        ) -> StorageResult<Option<SealedBlockHeader>> {
-            unimplemented!()
-        }
-
         fn get_sealed_headers(
             &self,
             _block_height_range: Range<u32>,
-        ) -> StorageResult<Vec<SealedBlockHeader>> {
+        ) -> StorageResult<Option<Vec<SealedBlockHeader>>> {
             unimplemented!()
         }
 
@@ -876,6 +1446,10 @@ pub mod tests {
             _block_height_range: Range<u32>,
         ) -> StorageResult<Option<Vec<Transactions>>> {
             unimplemented!()
+        }
+
+        fn get_genesis(&self) -> StorageResult<Genesis> {
+            Ok(Default::default())
         }
     }
 
@@ -888,10 +1462,39 @@ pub mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct FakeTxPool;
+
+    impl TxPool for FakeTxPool {
+        async fn get_tx_ids(
+            &self,
+            _max_txs: usize,
+        ) -> anyhow::Result<Vec<fuel_core_types::fuel_tx::TxId>> {
+            Ok(vec![])
+        }
+
+        async fn get_full_txs(
+            &self,
+            tx_ids: Vec<TxId>,
+        ) -> anyhow::Result<Vec<Option<NetworkableTransactionPool>>> {
+            Ok(tx_ids.iter().map(|_| None).collect())
+        }
+    }
+
     #[tokio::test]
     async fn start_and_stop_awaits_works() {
-        let p2p_config = Config::default_initialized("start_stop_works");
-        let service = new_service(p2p_config, FakeDb, FakeBlockImporter);
+        let p2p_config = Config::<NotInitialized>::default("start_stop_works");
+        let (shared_state, request_receiver) = build_shared_state(p2p_config.clone());
+        let service = new_service(
+            ChainId::default(),
+            0.into(),
+            p2p_config,
+            shared_state,
+            request_receiver,
+            FakeDb,
+            FakeBlockImporter,
+            FakeTxPool,
+        );
 
         // Node with p2p service started
         assert!(service.start_and_await().await.unwrap().started());
@@ -901,18 +1504,19 @@ pub mod tests {
 
     struct FakeP2PService {
         peer_info: Vec<(PeerId, PeerInfo)>,
+        next_event_stream: BoxStream<FuelP2PEvent>,
     }
 
     impl TaskP2PService for FakeP2PService {
-        fn get_peer_ids(&self) -> Vec<PeerId> {
-            todo!()
+        fn update_metrics<T>(&self, _: T)
+        where
+            T: FnOnce(),
+        {
+            unimplemented!()
         }
 
         fn get_all_peer_info(&self) -> Vec<(&PeerId, &PeerInfo)> {
-            self.peer_info
-                .iter()
-                .map(|(peer_id, peer_info)| (peer_id, peer_info))
-                .collect()
+            self.peer_info.iter().map(|tup| (&tup.0, &tup.1)).collect()
         }
 
         fn get_peer_id_with_height(&self, _height: &BlockHeight) -> Option<PeerId> {
@@ -920,7 +1524,7 @@ pub mod tests {
         }
 
         fn next_event(&mut self) -> BoxFuture<'_, Option<FuelP2PEvent>> {
-            std::future::pending().boxed()
+            self.next_event_stream.next().boxed()
         }
 
         fn publish_message(
@@ -934,15 +1538,15 @@ pub mod tests {
             &mut self,
             _peer_id: Option<PeerId>,
             _request_msg: RequestMessage,
-            _channel_item: ResponseChannelItem,
+            _on_response: ResponseSender,
         ) -> anyhow::Result<()> {
             todo!()
         }
 
         fn send_response_msg(
             &mut self,
-            _request_id: RequestId,
-            _message: OutboundResponse,
+            _request_id: InboundRequestId,
+            _message: V2ResponseMessage,
         ) -> anyhow::Result<()> {
             todo!()
         }
@@ -965,31 +1569,26 @@ pub mod tests {
         }
 
         fn update_block_height(&mut self, _height: BlockHeight) -> anyhow::Result<()> {
-            todo!()
+            Ok(())
         }
     }
 
+    #[derive(Clone)]
     struct FakeDB;
 
+    impl AtomicView for FakeDB {
+        type LatestView = Self;
+
+        fn latest_view(&self) -> StorageResult<Self::LatestView> {
+            Ok(self.clone())
+        }
+    }
+
     impl P2pDb for FakeDB {
-        fn get_sealed_block(
-            &self,
-            _height: &BlockHeight,
-        ) -> StorageResult<Option<SealedBlock>> {
-            todo!()
-        }
-
-        fn get_sealed_header(
-            &self,
-            _height: &BlockHeight,
-        ) -> StorageResult<Option<SealedBlockHeader>> {
-            todo!()
-        }
-
         fn get_sealed_headers(
             &self,
             _block_height_range: Range<u32>,
-        ) -> StorageResult<Vec<SealedBlockHeader>> {
+        ) -> StorageResult<Option<Vec<SealedBlockHeader>>> {
             todo!()
         }
 
@@ -997,6 +1596,10 @@ pub mod tests {
             &self,
             _block_height_range: Range<u32>,
         ) -> StorageResult<Option<Vec<Transactions>>> {
+            todo!()
+        }
+
+        fn get_genesis(&self) -> StorageResult<Genesis> {
             todo!()
         }
     }
@@ -1033,6 +1636,13 @@ pub mod tests {
         ) -> anyhow::Result<()> {
             todo!()
         }
+
+        fn new_tx_subscription_broadcast(
+            &self,
+            _peer_id: FuelPeerId,
+        ) -> anyhow::Result<()> {
+            todo!()
+        }
     }
 
     #[tokio::test]
@@ -1047,6 +1657,7 @@ pub mod tests {
         let heartbeat_data = HeartbeatData {
             block_height: None,
             last_heartbeat: Instant::now(),
+            last_heartbeat_sys: SystemTime::now(),
             window: 0,
             durations,
         };
@@ -1057,8 +1668,11 @@ pub mod tests {
             score: 100.0,
         };
         let peer_info = vec![(peer_id, peer_info)];
-        let p2p_service = FakeP2PService { peer_info };
-        let (_request_sender, request_receiver) = mpsc::channel(100);
+        let p2p_service = FakeP2PService {
+            peer_info,
+            next_event_stream: Box::pin(futures::stream::pending()),
+        };
+        let (request_sender, request_receiver) = mpsc::channel(100);
 
         let (report_sender, mut report_receiver) = mpsc::channel(100);
         let broadcast = FakeBroadcast {
@@ -1077,28 +1691,38 @@ pub mod tests {
         };
 
         let mut task = Task {
+            chain_id: Default::default(),
+            response_timeout: Default::default(),
             p2p_service,
-            db: Arc::new(FakeDB),
+            view_provider: FakeDB,
             next_block_height: FakeBlockImporter.next_block_height(),
+            tx_pool: FakeTxPool,
             request_receiver,
+            request_sender,
+            db_heavy_task_processor: SyncProcessor::new("Test", 1, 1).unwrap(),
+            tx_pool_heavy_task_processor: AsyncProcessor::new("Test", 1, 1).unwrap(),
             broadcast,
             max_headers_per_request: 0,
+            max_txs_per_request: 100,
             heartbeat_check_interval: Duration::from_secs(0),
             heartbeat_max_avg_interval,
             heartbeat_max_time_since_last,
             next_check_time: Instant::now(),
             heartbeat_peer_reputation_config: heartbeat_peer_reputation_config.clone(),
+            cached_view: Arc::new(CachedView::new(100, false)),
         };
         let (watch_sender, watch_receiver) = tokio::sync::watch::channel(State::Started);
         let mut watcher = StateWatcher::from(watch_receiver);
 
         // when
-        task.run(&mut watcher).await.unwrap();
+        let (report_peer_id, report, reporting_service) = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_until_report_received(&mut report_receiver, &mut task, &mut watcher),
+        )
+        .await
+        .unwrap();
 
         // then
-        let (report_peer_id, report, reporting_service) =
-            report_receiver.recv().await.unwrap();
-
         watch_sender.send(State::Stopped).unwrap();
 
         assert_eq!(
@@ -1119,12 +1743,14 @@ pub mod tests {
         // under the limit
         let last_duration = Duration::from_secs(5);
         let last_heartbeat = Instant::now() - Duration::from_secs(50);
+        let last_heartbeat_sys = SystemTime::now() - Duration::from_secs(50);
         let mut durations = VecDeque::new();
         durations.push_front(last_duration);
 
         let heartbeat_data = HeartbeatData {
             block_height: None,
             last_heartbeat,
+            last_heartbeat_sys,
             window: 0,
             durations,
         };
@@ -1135,8 +1761,11 @@ pub mod tests {
             score: 100.0,
         };
         let peer_info = vec![(peer_id, peer_info)];
-        let p2p_service = FakeP2PService { peer_info };
-        let (_request_sender, request_receiver) = mpsc::channel(100);
+        let p2p_service = FakeP2PService {
+            peer_info,
+            next_event_stream: Box::pin(futures::stream::pending()),
+        };
+        let (request_sender, request_receiver) = mpsc::channel(100);
 
         let (report_sender, mut report_receiver) = mpsc::channel(100);
         let broadcast = FakeBroadcast {
@@ -1155,28 +1784,39 @@ pub mod tests {
         };
 
         let mut task = Task {
+            chain_id: Default::default(),
+            response_timeout: Default::default(),
             p2p_service,
-            db: Arc::new(FakeDB),
+            view_provider: FakeDB,
+            tx_pool: FakeTxPool,
             next_block_height: FakeBlockImporter.next_block_height(),
             request_receiver,
+            request_sender,
+            db_heavy_task_processor: SyncProcessor::new("Test", 1, 1).unwrap(),
+            tx_pool_heavy_task_processor: AsyncProcessor::new("Test", 1, 1).unwrap(),
             broadcast,
             max_headers_per_request: 0,
+            max_txs_per_request: 100,
             heartbeat_check_interval: Duration::from_secs(0),
             heartbeat_max_avg_interval,
             heartbeat_max_time_since_last,
             next_check_time: Instant::now(),
             heartbeat_peer_reputation_config: heartbeat_peer_reputation_config.clone(),
+            cached_view: Arc::new(CachedView::new(100, false)),
         };
         let (watch_sender, watch_receiver) = tokio::sync::watch::channel(State::Started);
         let mut watcher = StateWatcher::from(watch_receiver);
 
         // when
-        task.run(&mut watcher).await.unwrap();
+        // we run this in a loop to ensure that the task is run until it reports
+        let (report_peer_id, report, reporting_service) = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_until_report_received(&mut report_receiver, &mut task, &mut watcher),
+        )
+        .await
+        .unwrap();
 
         // then
-        let (report_peer_id, report, reporting_service) =
-            report_receiver.recv().await.unwrap();
-
         watch_sender.send(State::Stopped).unwrap();
 
         assert_eq!(
@@ -1188,5 +1828,72 @@ pub mod tests {
             heartbeat_peer_reputation_config.old_heartbeat_penalty
         );
         assert_eq!(reporting_service, "p2p");
+    }
+
+    async fn wait_until_report_received(
+        report_receiver: &mut Receiver<(FuelPeerId, AppScore, String)>,
+        task: &mut Task<FakeP2PService, FakeDB, FakeBroadcast, FakeTxPool>,
+        watcher: &mut StateWatcher,
+    ) -> (FuelPeerId, AppScore, String) {
+        loop {
+            task.run(watcher).await;
+            if let Ok((peer_id, recv_report, service)) = report_receiver.try_recv() {
+                return (peer_id, recv_report, service);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn should_process_all_imported_block_under_infinite_events_from_p2p() {
+        // Given
+        let (blocks_processed_sender, mut block_processed_receiver) = mpsc::channel(1);
+        let next_block_height = Box::pin(futures::stream::repeat_with(move || {
+            blocks_processed_sender.try_send(()).unwrap();
+            BlockHeight::from(0)
+        }));
+        let infinite_event_stream = Box::pin(futures::stream::empty());
+        let p2p_service = FakeP2PService {
+            peer_info: vec![],
+            next_event_stream: infinite_event_stream,
+        };
+
+        // Initialization
+        let (request_sender, request_receiver) = mpsc::channel(100);
+        let broadcast = FakeBroadcast {
+            peer_reports: mpsc::channel(100).0,
+        };
+        let mut task = Task {
+            chain_id: Default::default(),
+            response_timeout: Default::default(),
+            p2p_service,
+            tx_pool: FakeTxPool,
+            view_provider: FakeDB,
+            next_block_height,
+            request_receiver,
+            request_sender,
+            db_heavy_task_processor: SyncProcessor::new("Test", 1, 1).unwrap(),
+            tx_pool_heavy_task_processor: AsyncProcessor::new("Test", 1, 1).unwrap(),
+            broadcast,
+            max_headers_per_request: 0,
+            max_txs_per_request: 100,
+            heartbeat_check_interval: Duration::from_secs(0),
+            heartbeat_max_avg_interval: Default::default(),
+            heartbeat_max_time_since_last: Default::default(),
+            next_check_time: Instant::now(),
+            heartbeat_peer_reputation_config: Default::default(),
+            cached_view: Arc::new(CachedView::new(100, false)),
+        };
+        let mut watcher = StateWatcher::started();
+        // End of initialization
+
+        for _ in 0..100 {
+            // When
+            task.run(&mut watcher).await;
+
+            // Then
+            block_processed_receiver
+                .try_recv()
+                .expect("Should process the block height even under p2p pressure");
+        }
     }
 }

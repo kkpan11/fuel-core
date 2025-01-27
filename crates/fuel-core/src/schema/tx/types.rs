@@ -5,32 +5,36 @@ use super::{
 };
 use crate::{
     fuel_core_graphql_api::{
-        service::{
-            Database,
+        api_service::{
+            ConsensusProvider,
             TxPool,
         },
-        Config,
+        database::ReadView,
+        query_costs,
         IntoApiResult,
-    },
-    query::{
-        SimpleBlockData,
-        SimpleTransactionData,
-        TransactionQueryData,
     },
     schema::{
         block::Block,
-        contract::Contract,
         scalars::{
             AssetId,
+            BlobId,
             Bytes32,
+            ContractId,
             HexString,
             Salt,
             Tai64Timestamp,
             TransactionId,
             TxPointer,
+            U16,
             U32,
             U64,
         },
+        tx::{
+            input,
+            output,
+            upgrade_purpose::UpgradePurpose,
+        },
+        ReadViewProvider,
     },
 };
 use async_graphql::{
@@ -41,34 +45,53 @@ use async_graphql::{
 };
 use fuel_core_storage::Error as StorageError;
 use fuel_core_types::{
-    blockchain::primitives,
     fuel_tx::{
         self,
         field::{
-            BytecodeLength,
+            BytecodeRoot,
             BytecodeWitnessIndex,
+            ChargeableBody,
+            InputContract,
             Inputs,
             Maturity,
+            MintAmount,
+            MintAssetId,
+            MintGasPrice,
+            OutputContract,
             Outputs,
+            Policies as PoliciesField,
+            ProofSet,
             ReceiptsRoot,
             Salt as SaltField,
             Script as ScriptField,
             ScriptData,
+            ScriptGasLimit,
             StorageSlots,
+            SubsectionIndex,
+            SubsectionsNumber,
             TxPointer as TxPointerField,
+            UpgradePurpose as UpgradePurposeField,
             Witnesses,
         },
-        Chargeable,
+        policies::PolicyType,
         Executable,
+        TxId,
     },
     fuel_types::canonical::Serialize,
     fuel_vm::ProgramState as VmProgramState,
     services::{
-        txpool,
-        txpool::TransactionStatus as TxStatus,
+        executor::{
+            TransactionExecutionResult,
+            TransactionExecutionStatus,
+        },
+        txpool::{
+            self,
+            TransactionStatus as TxStatus,
+        },
     },
     tai64::Tai64,
 };
+use std::vec::IntoIter;
 
 pub struct ProgramState {
     return_type: ReturnType,
@@ -135,17 +158,37 @@ impl SubmittedStatus {
 
 #[derive(Debug)]
 pub struct SuccessStatus {
-    block_id: primitives::BlockId,
+    tx_id: TxId,
+    block_height: fuel_core_types::fuel_types::BlockHeight,
     time: Tai64,
     result: Option<VmProgramState>,
+    receipts: Vec<fuel_tx::Receipt>,
+    total_gas: u64,
+    total_fee: u64,
 }
 
 #[Object]
 impl SuccessStatus {
+    async fn transaction_id(&self) -> TransactionId {
+        self.tx_id.into()
+    }
+
+    async fn block_height(&self) -> U32 {
+        self.block_height.into()
+    }
+
+    #[graphql(complexity = "query_costs().block_header + child_complexity")]
     async fn block(&self, ctx: &Context<'_>) -> async_graphql::Result<Block> {
-        let query: &Database = ctx.data_unchecked();
-        let block = query.block(&self.block_id)?;
+        let query = ctx.read_view()?;
+        let block = query.block(&self.block_height)?;
         Ok(block.into())
+    }
+
+    #[graphql(complexity = "query_costs().storage_read + child_complexity")]
+    async fn transaction(&self, ctx: &Context<'_>) -> async_graphql::Result<Transaction> {
+        let query = ctx.read_view()?;
+        let transaction = query.transaction(&self.tx_id)?;
+        Ok(Transaction::from_tx(self.tx_id, transaction))
     }
 
     async fn time(&self) -> Tai64Timestamp {
@@ -155,22 +198,53 @@ impl SuccessStatus {
     async fn program_state(&self) -> Option<ProgramState> {
         self.result.map(Into::into)
     }
+
+    async fn receipts(&self) -> async_graphql::Result<Vec<Receipt>> {
+        Ok(self.receipts.iter().map(Into::into).collect())
+    }
+
+    async fn total_gas(&self) -> U64 {
+        self.total_gas.into()
+    }
+
+    async fn total_fee(&self) -> U64 {
+        self.total_fee.into()
+    }
 }
 
 #[derive(Debug)]
 pub struct FailureStatus {
-    block_id: primitives::BlockId,
+    tx_id: TxId,
+    block_height: fuel_core_types::fuel_types::BlockHeight,
     time: Tai64,
-    reason: String,
     state: Option<VmProgramState>,
+    receipts: Vec<fuel_tx::Receipt>,
+    total_gas: u64,
+    total_fee: u64,
 }
 
 #[Object]
 impl FailureStatus {
+    async fn transaction_id(&self) -> TransactionId {
+        self.tx_id.into()
+    }
+
+    async fn block_height(&self) -> U32 {
+        self.block_height.into()
+    }
+
+    #[graphql(complexity = "query_costs().block_header + child_complexity")]
     async fn block(&self, ctx: &Context<'_>) -> async_graphql::Result<Block> {
-        let query: &Database = ctx.data_unchecked();
-        let block = query.block(&self.block_id)?;
+        let query = ctx.read_view()?;
+        let block = query.block(&self.block_height)?;
         Ok(block.into())
+    }
+
+    #[graphql(complexity = "query_costs().storage_read + child_complexity")]
+    async fn transaction(&self, ctx: &Context<'_>) -> async_graphql::Result<Transaction> {
+        let query = ctx.read_view()?;
+        let transaction = query.transaction(&self.tx_id)?;
+        Ok(Transaction::from_tx(self.tx_id, transaction))
     }
 
     async fn time(&self) -> Tai64Timestamp {
@@ -178,11 +252,23 @@ impl FailureStatus {
     }
 
     async fn reason(&self) -> String {
-        self.reason.clone()
+        TransactionExecutionResult::reason(&self.receipts, &self.state)
     }
 
     async fn program_state(&self) -> Option<ProgramState> {
         self.state.map(Into::into)
+    }
+
+    async fn receipts(&self) -> async_graphql::Result<Vec<Receipt>> {
+        Ok(self.receipts.iter().map(Into::into).collect())
+    }
+
+    async fn total_gas(&self) -> U64 {
+        self.total_gas.into()
+    }
+
+    async fn total_fee(&self) -> U64 {
+        self.total_fee.into()
     }
 }
 
@@ -198,34 +284,46 @@ impl SqueezedOutStatus {
     }
 }
 
-impl From<TxStatus> for TransactionStatus {
-    fn from(s: TxStatus) -> Self {
-        match s {
+impl TransactionStatus {
+    pub fn new(tx_id: TxId, tx_status: TxStatus) -> Self {
+        match tx_status {
             TxStatus::Submitted { time } => {
                 TransactionStatus::Submitted(SubmittedStatus(time))
             }
             TxStatus::Success {
-                block_id,
+                block_height,
                 result,
                 time,
+                receipts,
+                total_gas,
+                total_fee,
             } => TransactionStatus::Success(SuccessStatus {
-                block_id,
+                tx_id,
+                block_height,
                 result,
                 time,
+                receipts,
+                total_gas,
+                total_fee,
             }),
             TxStatus::SqueezedOut { reason } => {
                 TransactionStatus::SqueezedOut(SqueezedOutStatus { reason })
             }
             TxStatus::Failed {
-                block_id,
-                reason,
+                block_height,
                 time,
                 result,
+                receipts,
+                total_gas,
+                total_fee,
             } => TransactionStatus::Failed(FailureStatus {
-                block_id,
-                reason,
+                tx_id,
+                block_height,
                 time,
                 state: result,
+                receipts,
+                total_gas,
+                total_fee,
             }),
         }
     }
@@ -238,31 +336,68 @@ impl From<TransactionStatus> for TxStatus {
                 TxStatus::Submitted { time }
             }
             TransactionStatus::Success(SuccessStatus {
-                block_id,
+                block_height,
                 result,
                 time,
+                receipts,
+                total_gas,
+                total_fee,
+                ..
             }) => TxStatus::Success {
-                block_id,
+                block_height,
                 result,
                 time,
+                receipts,
+                total_gas,
+                total_fee,
             },
             TransactionStatus::SqueezedOut(SqueezedOutStatus { reason }) => {
                 TxStatus::SqueezedOut { reason }
             }
             TransactionStatus::Failed(FailureStatus {
-                block_id,
-                reason,
+                block_height,
                 time,
                 state: result,
+                receipts,
+                total_gas,
+                total_fee,
+                ..
             }) => TxStatus::Failed {
-                block_id,
-                reason,
+                block_height,
                 time,
                 result,
+                receipts,
+                total_gas,
+                total_fee,
             },
         }
     }
 }
+
+pub struct Policies(fuel_tx::policies::Policies);
+
+#[Object]
+impl Policies {
+    async fn tip(&self) -> Option<U64> {
+        self.0.get(PolicyType::Tip).map(Into::into)
+    }
+
+    async fn witness_limit(&self) -> Option<U64> {
+        self.0.get(PolicyType::WitnessLimit).map(Into::into)
+    }
+
+    async fn maturity(&self) -> Option<U32> {
+        self.0
+            .get(PolicyType::Maturity)
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Into::into)
+    }
+
+    async fn max_fee(&self) -> Option<U64> {
+        self.0.get(PolicyType::MaxFee).map(Into::into)
+    }
+}
+
 pub struct Transaction(pub(crate) fuel_tx::Transaction, pub(crate) fuel_tx::TxId);
 
 impl Transaction {
@@ -277,67 +412,152 @@ impl Transaction {
         TransactionId(self.1)
     }
 
+    #[graphql(complexity = "query_costs().storage_read")]
     async fn input_asset_ids(&self, ctx: &Context<'_>) -> Option<Vec<AssetId>> {
-        let config = ctx.data_unchecked::<Config>();
-        let base_asset_id = config.consensus_parameters.base_asset_id();
+        let params = ctx
+            .data_unchecked::<ConsensusProvider>()
+            .latest_consensus_params();
+        let base_asset_id = params.base_asset_id();
         match &self.0 {
-            fuel_tx::Transaction::Script(script) => Some(
-                script
-                    .input_asset_ids(base_asset_id)
+            fuel_tx::Transaction::Script(tx) => Some(
+                tx.input_asset_ids(base_asset_id)
                     .map(|c| AssetId(*c))
                     .collect(),
             ),
-            fuel_tx::Transaction::Create(create) => Some(
-                create
-                    .input_asset_ids(base_asset_id)
+            fuel_tx::Transaction::Create(tx) => Some(
+                tx.input_asset_ids(base_asset_id)
                     .map(|c| AssetId(*c))
                     .collect(),
             ),
             fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Upgrade(tx) => Some(
+                tx.input_asset_ids(base_asset_id)
+                    .map(|c| AssetId(*c))
+                    .collect(),
+            ),
+            fuel_tx::Transaction::Upload(tx) => Some(
+                tx.input_asset_ids(base_asset_id)
+                    .map(|c| AssetId(*c))
+                    .collect(),
+            ),
+            fuel_tx::Transaction::Blob(tx) => Some(
+                tx.input_asset_ids(base_asset_id)
+                    .map(|c| AssetId(*c))
+                    .collect(),
+            ),
         }
     }
 
-    async fn input_contracts(&self) -> Option<Vec<Contract>> {
+    async fn input_contracts(&self) -> Option<Vec<ContractId>> {
+        match &self.0 {
+            fuel_tx::Transaction::Script(tx) => {
+                Some(input_contracts(tx).map(|v| (*v).into()).collect())
+            }
+            fuel_tx::Transaction::Create(tx) => {
+                Some(input_contracts(tx).map(|v| (*v).into()).collect())
+            }
+            fuel_tx::Transaction::Mint(mint) => {
+                Some(vec![mint.input_contract().contract_id.into()])
+            }
+            fuel_tx::Transaction::Upgrade(tx) => {
+                Some(input_contracts(tx).map(|v| (*v).into()).collect())
+            }
+            fuel_tx::Transaction::Upload(tx) => {
+                Some(input_contracts(tx).map(|v| (*v).into()).collect())
+            }
+            fuel_tx::Transaction::Blob(tx) => {
+                Some(input_contracts(tx).map(|v| (*v).into()).collect())
+            }
+        }
+    }
+
+    async fn input_contract(&self) -> Option<input::InputContract> {
+        match &self.0 {
+            fuel_tx::Transaction::Script(_)
+            | fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Upload(_)
+            | fuel_tx::Transaction::Blob(_) => None,
+            fuel_tx::Transaction::Mint(mint) => Some(mint.input_contract().into()),
+        }
+    }
+
+    async fn policies(&self) -> Option<Policies> {
+        match &self.0 {
+            fuel_tx::Transaction::Script(tx) => Some((*tx.policies()).into()),
+            fuel_tx::Transaction::Create(tx) => Some((*tx.policies()).into()),
+            fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Upgrade(tx) => Some((*tx.policies()).into()),
+            fuel_tx::Transaction::Upload(tx) => Some((*tx.policies()).into()),
+            fuel_tx::Transaction::Blob(tx) => Some((*tx.policies()).into()),
+        }
+    }
+
+    async fn script_gas_limit(&self) -> Option<U64> {
         match &self.0 {
             fuel_tx::Transaction::Script(script) => {
-                Some(script.input_contracts().map(|v| Contract(*v)).collect())
+                Some((*script.script_gas_limit()).into())
             }
-            fuel_tx::Transaction::Create(create) => {
-                Some(create.input_contracts().map(|v| Contract(*v)).collect())
-            }
-            fuel_tx::Transaction::Mint(_) => None,
-        }
-    }
-
-    async fn gas_price(&self) -> Option<U64> {
-        match &self.0 {
-            fuel_tx::Transaction::Script(script) => Some(script.price().into()),
-            fuel_tx::Transaction::Create(create) => Some(create.price().into()),
-            fuel_tx::Transaction::Mint(_) => None,
-        }
-    }
-
-    async fn gas_limit(&self) -> Option<U64> {
-        match &self.0 {
-            fuel_tx::Transaction::Script(script) => Some(script.limit().into()),
-            fuel_tx::Transaction::Create(create) => Some(create.limit().into()),
-            fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Mint(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Upload(_)
+            | fuel_tx::Transaction::Blob(_) => None,
         }
     }
 
     async fn maturity(&self) -> Option<U32> {
         match &self.0 {
-            fuel_tx::Transaction::Script(script) => Some((*script.maturity()).into()),
-            fuel_tx::Transaction::Create(create) => Some((*create.maturity()).into()),
+            fuel_tx::Transaction::Script(tx) => Some(tx.maturity().into()),
+            fuel_tx::Transaction::Create(tx) => Some(tx.maturity().into()),
             fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Upgrade(tx) => Some(tx.maturity().into()),
+            fuel_tx::Transaction::Upload(tx) => Some(tx.maturity().into()),
+            fuel_tx::Transaction::Blob(tx) => Some(tx.maturity().into()),
+        }
+    }
+
+    async fn mint_amount(&self) -> Option<U64> {
+        match &self.0 {
+            fuel_tx::Transaction::Script(_)
+            | fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Upload(_)
+            | fuel_tx::Transaction::Blob(_) => None,
+            fuel_tx::Transaction::Mint(mint) => Some((*mint.mint_amount()).into()),
+        }
+    }
+
+    async fn mint_asset_id(&self) -> Option<AssetId> {
+        match &self.0 {
+            fuel_tx::Transaction::Script(_)
+            | fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Upload(_)
+            | fuel_tx::Transaction::Blob(_) => None,
+            fuel_tx::Transaction::Mint(mint) => Some((*mint.mint_asset_id()).into()),
+        }
+    }
+
+    async fn mint_gas_price(&self) -> Option<U64> {
+        match &self.0 {
+            fuel_tx::Transaction::Script(_)
+            | fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Upload(_)
+            | fuel_tx::Transaction::Blob(_) => None,
+            fuel_tx::Transaction::Mint(mint) => Some((*mint.gas_price()).into()),
         }
     }
 
     // TODO: Maybe we need to do the same `Script` and `Create`
     async fn tx_pointer(&self) -> Option<TxPointer> {
         match &self.0 {
-            fuel_tx::Transaction::Script(_) => None,
-            fuel_tx::Transaction::Create(_) => None,
+            fuel_tx::Transaction::Script(_)
+            | fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Upload(_)
+            | fuel_tx::Transaction::Blob(_) => None,
             fuel_tx::Transaction::Mint(mint) => Some((*mint.tx_pointer()).into()),
         }
     }
@@ -354,49 +574,104 @@ impl Transaction {
         self.0.is_mint()
     }
 
+    async fn is_upgrade(&self) -> bool {
+        self.0.is_upgrade()
+    }
+
+    async fn is_upload(&self) -> bool {
+        self.0.is_upload()
+    }
+
+    async fn is_blob(&self) -> bool {
+        self.0.is_blob()
+    }
+
     async fn inputs(&self) -> Option<Vec<Input>> {
         match &self.0 {
-            fuel_tx::Transaction::Script(script) => {
-                Some(script.inputs().iter().map(Into::into).collect())
+            fuel_tx::Transaction::Script(tx) => {
+                Some(tx.inputs().iter().map(Into::into).collect())
             }
-            fuel_tx::Transaction::Create(create) => {
-                Some(create.inputs().iter().map(Into::into).collect())
+            fuel_tx::Transaction::Create(tx) => {
+                Some(tx.inputs().iter().map(Into::into).collect())
             }
             fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Upgrade(tx) => {
+                Some(tx.inputs().iter().map(Into::into).collect())
+            }
+            fuel_tx::Transaction::Upload(tx) => {
+                Some(tx.inputs().iter().map(Into::into).collect())
+            }
+            fuel_tx::Transaction::Blob(tx) => {
+                Some(tx.inputs().iter().map(Into::into).collect())
+            }
         }
     }
 
     async fn outputs(&self) -> Vec<Output> {
         match &self.0 {
-            fuel_tx::Transaction::Script(script) => {
-                script.outputs().iter().map(Into::into).collect()
+            fuel_tx::Transaction::Script(tx) => {
+                tx.outputs().iter().map(Into::into).collect()
             }
-            fuel_tx::Transaction::Create(create) => {
-                create.outputs().iter().map(Into::into).collect()
+            fuel_tx::Transaction::Create(tx) => {
+                tx.outputs().iter().map(Into::into).collect()
             }
-            fuel_tx::Transaction::Mint(mint) => {
-                mint.outputs().iter().map(Into::into).collect()
+            fuel_tx::Transaction::Mint(_) => vec![],
+            fuel_tx::Transaction::Upgrade(tx) => {
+                tx.outputs().iter().map(Into::into).collect()
             }
+            fuel_tx::Transaction::Upload(tx) => {
+                tx.outputs().iter().map(Into::into).collect()
+            }
+            fuel_tx::Transaction::Blob(tx) => {
+                tx.outputs().iter().map(Into::into).collect()
+            }
+        }
+    }
+
+    async fn output_contract(&self) -> Option<output::ContractOutput> {
+        match &self.0 {
+            fuel_tx::Transaction::Script(_)
+            | fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Upload(_)
+            | fuel_tx::Transaction::Blob(_) => None,
+            fuel_tx::Transaction::Mint(mint) => Some(mint.output_contract().into()),
         }
     }
 
     async fn witnesses(&self) -> Option<Vec<HexString>> {
         match &self.0 {
-            fuel_tx::Transaction::Script(script) => Some(
-                script
-                    .witnesses()
+            fuel_tx::Transaction::Script(tx) => Some(
+                tx.witnesses()
                     .iter()
                     .map(|w| HexString(w.clone().into_inner()))
                     .collect(),
             ),
-            fuel_tx::Transaction::Create(create) => Some(
-                create
-                    .witnesses()
+            fuel_tx::Transaction::Create(tx) => Some(
+                tx.witnesses()
                     .iter()
                     .map(|w| HexString(w.clone().into_inner()))
                     .collect(),
             ),
             fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Upgrade(tx) => Some(
+                tx.witnesses()
+                    .iter()
+                    .map(|w| HexString(w.clone().into_inner()))
+                    .collect(),
+            ),
+            fuel_tx::Transaction::Upload(tx) => Some(
+                tx.witnesses()
+                    .iter()
+                    .map(|w| HexString(w.clone().into_inner()))
+                    .collect(),
+            ),
+            fuel_tx::Transaction::Blob(tx) => Some(
+                tx.witnesses()
+                    .iter()
+                    .map(|w| HexString(w.clone().into_inner()))
+                    .collect(),
+            ),
         }
     }
 
@@ -405,30 +680,25 @@ impl Transaction {
             fuel_tx::Transaction::Script(script) => {
                 Some((*script.receipts_root()).into())
             }
-            fuel_tx::Transaction::Create(_) => None,
-            fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Mint(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Upload(_)
+            | fuel_tx::Transaction::Blob(_) => None,
         }
     }
 
+    #[graphql(complexity = "query_costs().tx_status_read + child_complexity")]
     async fn status(
         &self,
         ctx: &Context<'_>,
     ) -> async_graphql::Result<Option<TransactionStatus>> {
         let id = self.1;
-        let query: &Database = ctx.data_unchecked();
+        let query = ctx.read_view()?;
         let txpool = ctx.data_unchecked::<TxPool>();
-        get_tx_status(id, query, txpool).map_err(Into::into)
-    }
-
-    async fn receipts(
-        &self,
-        ctx: &Context<'_>,
-    ) -> async_graphql::Result<Option<Vec<Receipt>>> {
-        let query: &Database = ctx.data_unchecked();
-        let receipts = query
-            .receipts(&self.1)
-            .into_api_result::<Vec<_>, async_graphql::Error>()?;
-        Ok(receipts.map(|receipts| receipts.into_iter().map(Receipt).collect()))
+        get_tx_status(id, query.as_ref(), txpool)
+            .await
+            .map_err(Into::into)
     }
 
     async fn script(&self) -> Option<HexString> {
@@ -436,8 +706,11 @@ impl Transaction {
             fuel_tx::Transaction::Script(script) => {
                 Some(HexString(script.script().clone()))
             }
-            fuel_tx::Transaction::Create(_) => None,
-            fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Mint(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Upload(_)
+            | fuel_tx::Transaction::Blob(_) => None,
         }
     }
 
@@ -446,28 +719,33 @@ impl Transaction {
             fuel_tx::Transaction::Script(script) => {
                 Some(HexString(script.script_data().clone()))
             }
-            fuel_tx::Transaction::Create(_) => None,
-            fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Mint(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Upload(_)
+            | fuel_tx::Transaction::Blob(_) => None,
         }
     }
 
-    async fn bytecode_witness_index(&self) -> Option<u8> {
+    async fn bytecode_witness_index(&self) -> Option<U16> {
         match &self.0 {
             fuel_tx::Transaction::Script(_) => None,
-            fuel_tx::Transaction::Create(create) => {
-                Some(*create.bytecode_witness_index())
+            fuel_tx::Transaction::Create(tx) => {
+                Some((*tx.bytecode_witness_index()).into())
             }
             fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Upgrade(_) => None,
+            fuel_tx::Transaction::Upload(tx) => {
+                Some((*tx.bytecode_witness_index()).into())
+            }
+            fuel_tx::Transaction::Blob(tx) => Some((*tx.bytecode_witness_index()).into()),
         }
     }
 
-    async fn bytecode_length(&self) -> Option<U64> {
+    async fn blob_id(&self) -> Option<BlobId> {
         match &self.0 {
-            fuel_tx::Transaction::Script(_) => None,
-            fuel_tx::Transaction::Create(create) => {
-                Some((*create.bytecode_length()).into())
-            }
-            fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Blob(blob) => Some(blob.body().id.into()),
+            _ => None,
         }
     }
 
@@ -476,6 +754,9 @@ impl Transaction {
             fuel_tx::Transaction::Script(_) => None,
             fuel_tx::Transaction::Create(create) => Some((*create.salt()).into()),
             fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Upgrade(_) => None,
+            fuel_tx::Transaction::Upload(_) => None,
+            fuel_tx::Transaction::Blob(_) => None,
         }
     }
 
@@ -499,31 +780,237 @@ impl Transaction {
                     .collect(),
             ),
             fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Upgrade(_) => None,
+            fuel_tx::Transaction::Upload(_) => None,
+            fuel_tx::Transaction::Blob(_) => None,
         }
     }
 
+    async fn bytecode_root(&self) -> Option<Bytes32> {
+        match &self.0 {
+            fuel_tx::Transaction::Script(_)
+            | fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Mint(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Blob(_) => None,
+            fuel_tx::Transaction::Upload(tx) => Some((*tx.bytecode_root()).into()),
+        }
+    }
+
+    async fn subsection_index(&self) -> Option<U16> {
+        match &self.0 {
+            fuel_tx::Transaction::Script(_)
+            | fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Mint(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Blob(_) => None,
+            fuel_tx::Transaction::Upload(tx) => Some((*tx.subsection_index()).into()),
+        }
+    }
+
+    async fn subsections_number(&self) -> Option<U16> {
+        match &self.0 {
+            fuel_tx::Transaction::Script(_)
+            | fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Mint(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Blob(_) => None,
+            fuel_tx::Transaction::Upload(tx) => Some((*tx.subsections_number()).into()),
+        }
+    }
+
+    async fn proof_set(&self) -> Option<Vec<Bytes32>> {
+        match &self.0 {
+            fuel_tx::Transaction::Script(_)
+            | fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Mint(_)
+            | fuel_tx::Transaction::Upgrade(_)
+            | fuel_tx::Transaction::Blob(_) => None,
+            fuel_tx::Transaction::Upload(tx) => {
+                Some(tx.proof_set().iter().map(|proof| (*proof).into()).collect())
+            }
+        }
+    }
+
+    async fn upgrade_purpose(&self) -> Option<UpgradePurpose> {
+        match &self.0 {
+            fuel_tx::Transaction::Script(_)
+            | fuel_tx::Transaction::Create(_)
+            | fuel_tx::Transaction::Mint(_) => None,
+            fuel_tx::Transaction::Upgrade(tx) => Some((*tx.upgrade_purpose()).into()),
+            fuel_tx::Transaction::Upload(_) => None,
+            fuel_tx::Transaction::Blob(_) => None,
+        }
+    }
+
+    #[graphql(complexity = "query_costs().tx_raw_payload")]
     /// Return the transaction bytes using canonical encoding
     async fn raw_payload(&self) -> HexString {
         HexString(self.0.clone().to_bytes())
     }
 }
 
+#[derive(Union, Debug)]
+pub enum DryRunTransactionStatus {
+    Success(DryRunSuccessStatus),
+    Failed(DryRunFailureStatus),
+}
+
+impl DryRunTransactionStatus {
+    pub fn new(tx_status: TransactionExecutionResult) -> Self {
+        match tx_status {
+            TransactionExecutionResult::Success {
+                result,
+                receipts,
+                total_gas,
+                total_fee,
+            } => DryRunTransactionStatus::Success(DryRunSuccessStatus {
+                result,
+                receipts,
+                total_gas,
+                total_fee,
+            }),
+            TransactionExecutionResult::Failed {
+                result,
+                receipts,
+                total_gas,
+                total_fee,
+            } => DryRunTransactionStatus::Failed(DryRunFailureStatus {
+                result,
+                receipts,
+                total_gas,
+                total_fee,
+            }),
+        }
+    }
+}
+
+fn input_contracts<Tx>(tx: &Tx) -> IntoIter<&fuel_core_types::fuel_types::ContractId>
+where
+    Tx: Inputs,
+{
+    let mut inputs: Vec<_> = tx
+        .inputs()
+        .iter()
+        .filter_map(|input| match input {
+            fuel_tx::Input::Contract(fuel_tx::input::contract::Contract {
+                contract_id,
+                ..
+            }) => Some(contract_id),
+            _ => None,
+        })
+        .collect();
+    inputs.sort();
+    inputs.dedup();
+    inputs.into_iter()
+}
+
+#[derive(Debug)]
+pub struct DryRunSuccessStatus {
+    result: Option<VmProgramState>,
+    receipts: Vec<fuel_tx::Receipt>,
+    total_gas: u64,
+    total_fee: u64,
+}
+
+#[Object]
+impl DryRunSuccessStatus {
+    async fn program_state(&self) -> Option<ProgramState> {
+        self.result.map(Into::into)
+    }
+
+    async fn receipts(&self) -> Vec<Receipt> {
+        self.receipts.iter().map(Into::into).collect()
+    }
+
+    async fn total_gas(&self) -> U64 {
+        self.total_gas.into()
+    }
+
+    async fn total_fee(&self) -> U64 {
+        self.total_fee.into()
+    }
+}
+
+#[derive(Debug)]
+pub struct DryRunFailureStatus {
+    result: Option<VmProgramState>,
+    receipts: Vec<fuel_tx::Receipt>,
+    total_gas: u64,
+    total_fee: u64,
+}
+
+#[Object]
+impl DryRunFailureStatus {
+    async fn program_state(&self) -> Option<ProgramState> {
+        self.result.map(Into::into)
+    }
+
+    async fn reason(&self) -> String {
+        TransactionExecutionResult::reason(&self.receipts, &self.result)
+    }
+
+    async fn receipts(&self) -> Vec<Receipt> {
+        self.receipts.iter().map(Into::into).collect()
+    }
+
+    async fn total_gas(&self) -> U64 {
+        self.total_gas.into()
+    }
+
+    async fn total_fee(&self) -> U64 {
+        self.total_fee.into()
+    }
+}
+
+pub struct DryRunTransactionExecutionStatus(pub TransactionExecutionStatus);
+
+#[Object]
+impl DryRunTransactionExecutionStatus {
+    async fn id(&self) -> TransactionId {
+        TransactionId(self.0.id)
+    }
+
+    async fn status(&self) -> DryRunTransactionStatus {
+        DryRunTransactionStatus::new(self.0.result.clone())
+    }
+
+    async fn receipts(&self) -> Vec<Receipt> {
+        self.0.result.receipts().iter().map(Into::into).collect()
+    }
+}
+
 #[tracing::instrument(level = "debug", skip(query, txpool), ret, err)]
-pub(crate) fn get_tx_status(
+pub(crate) async fn get_tx_status(
     id: fuel_core_types::fuel_types::Bytes32,
-    query: &Database,
+    query: &ReadView,
     txpool: &TxPool,
 ) -> Result<Option<TransactionStatus>, StorageError> {
     match query
-        .status(&id)
+        .tx_status(&id)
         .into_api_result::<txpool::TransactionStatus, StorageError>()?
     {
-        Some(status) => Ok(Some(status.into())),
-        None => match txpool.submission_time(id) {
-            Some(submitted_time) => Ok(Some(TransactionStatus::Submitted(
-                SubmittedStatus(submitted_time),
-            ))),
-            _ => Ok(None),
-        },
+        Some(status) => {
+            let status = TransactionStatus::new(id, status);
+            Ok(Some(status))
+        }
+        None => {
+            let submitted_time = txpool
+                .submission_time(id)
+                .await
+                .map_err(|e| StorageError::Other(anyhow::anyhow!(e)))?;
+            match submitted_time {
+                Some(submitted_time) => Ok(Some(TransactionStatus::Submitted(
+                    SubmittedStatus(submitted_time),
+                ))),
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
+impl From<fuel_tx::policies::Policies> for Policies {
+    fn from(value: fuel_tx::policies::Policies) -> Self {
+        Policies(value)
     }
 }

@@ -4,8 +4,21 @@ use fuel_core::service::{
 };
 
 // Add methods on commands
+use fuel_core::service::config::Trigger;
+use fuel_core_chain_config::{
+    SnapshotMetadata,
+    SnapshotReader,
+};
 use fuel_core_e2e_client::config::SuiteConfig;
-use std::fs;
+use fuel_core_types::{
+    blockchain::header::LATEST_STATE_TRANSITION_VERSION,
+    fuel_tx::ContractId,
+};
+use std::{
+    fs,
+    str::FromStr,
+    time::Duration,
+};
 use tempfile::TempDir; // Used for writing assertions // Run programs
 
 // Use Jemalloc
@@ -15,7 +28,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[tokio::test(flavor = "multi_thread")]
 async fn works_in_local_env() {
     // setup a local node
-    let srv = setup_local_node().await;
+    let srv = setup_dev_node().await;
     // generate a config file
     let config = generate_config_file(srv.bound_address.to_string());
     // execute suite
@@ -23,7 +36,6 @@ async fn works_in_local_env() {
 }
 
 // Spins up a node for each wallet and verifies that the suite works across multiple nodes
-#[cfg(feature = "p2p")]
 #[tokio::test(flavor = "multi_thread")]
 async fn works_in_multinode_local_env() {
     use fuel_core::p2p_test_helpers::*;
@@ -38,6 +50,7 @@ async fn works_in_multinode_local_env() {
         fuel_tx::Input,
     };
 
+    let config = dev_config();
     let mut rng = StdRng::seed_from_u64(line!() as u64);
     let secret = SecretKey::random(&mut rng);
     let pub_key = Input::owner(&secret.public_key());
@@ -51,6 +64,7 @@ async fn works_in_multinode_local_env() {
             ProducerSetup::new(secret).with_txs(1).with_name("Alice"),
         )],
         [Some(ValidatorSetup::new(pub_key).with_name("Bob"))],
+        Some(config),
     )
     .await;
 
@@ -84,15 +98,59 @@ async fn execute_suite(config_path: String) {
     .await;
 }
 
-async fn setup_local_node() -> FuelService {
-    let mut config = Config::local_node();
-    // The `run_contract_large_state` test creates a contract with a huge state
-    config
-        .chain_conf
+fn dev_config() -> Config {
+    let snapshot = SnapshotMetadata::read("../../bin/fuel-core/chainspec/local-testnet")
+        .expect("Should be able to open snapshot metadata");
+    let reader =
+        SnapshotReader::open(snapshot).expect("Should be able to open snapshot reader");
+
+    let mut chain_config = reader.chain_config().clone();
+    let contract_parameters = *chain_config.consensus_parameters.contract_params();
+    let tx_parameters = *chain_config.consensus_parameters.tx_params();
+    let fee_params = *chain_config.consensus_parameters.fee_params();
+
+    // The `run_contract_large_state` test creates a big contract with a huge state.
+    let max_storage_slots = 1 << 17 /* 131072 */;
+    let contract_max_size = 16 * 1024 * 1024 /* 16 MB */;
+    let contract_parameters = contract_parameters
+        .with_max_storage_slots(max_storage_slots)
+        .with_contract_max_size(contract_max_size);
+    let tx_parameters = tx_parameters.with_max_size(1024 * max_storage_slots);
+    let fee_params = fee_params.with_gas_per_byte(1);
+    chain_config
         .consensus_parameters
-        .contract_params
-        .max_storage_slots = 1 << 17; // 131072
-    FuelService::new_node(config).await.unwrap()
+        .set_contract_params(contract_parameters);
+    chain_config
+        .consensus_parameters
+        .set_tx_params(tx_parameters);
+    chain_config.consensus_parameters.set_fee_params(fee_params);
+    if let Err(_e) = chain_config
+        .consensus_parameters
+        .set_block_transaction_size_limit(u64::MAX)
+    {
+        eprintln!("failed to set block transaction size limit");
+    }
+    chain_config.state_transition_bytecode =
+        fuel_core::upgradable_executor::WASM_BYTECODE.to_vec();
+    chain_config.genesis_state_transition_version = Some(LATEST_STATE_TRANSITION_VERSION);
+    let reader = reader.with_chain_config(chain_config);
+
+    let mut config = Config::local_node_with_reader(reader);
+    config.starting_exec_gas_price = 1;
+    config.block_producer.coinbase_recipient = Some(
+        ContractId::from_str(
+            "0x7777777777777777777777777777777777777777777777777777777777777777",
+        )
+        .unwrap(),
+    );
+    config.block_production = Trigger::Interval {
+        block_time: Duration::from_secs(1),
+    };
+    config
+}
+
+async fn setup_dev_node() -> FuelService {
+    FuelService::new_node(dev_config()).await.unwrap()
 }
 
 fn generate_config_file(endpoint: String) -> TestConfig {

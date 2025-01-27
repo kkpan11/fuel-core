@@ -1,4 +1,5 @@
 use fuel_core_types::fuel_tx::{
+    consensus_parameters::gas::*,
     DependentCost,
     GasCostsValues,
 };

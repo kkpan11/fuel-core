@@ -1,93 +1,93 @@
-use crate::database::{
-    Column,
-    Result as DatabaseResult,
+use crate::{
+    database::database_description::DatabaseDescription,
+    state::{
+        generic_database::GenericDatabase,
+        iterable_key_value_view::IterableKeyValueViewWrapper,
+        key_value_view::KeyValueViewWrapper,
+    },
 };
-use fuel_core_storage::iter::{
-    BoxedIter,
-    IterDirection,
+use fuel_core_storage::{
+    iter::{
+        IterDirection,
+        IterableStore,
+    },
+    kv_store::StorageColumn,
+    transactional::Changes,
+    Result as StorageResult,
 };
-use std::{
-    fmt::Debug,
-    sync::Arc,
-};
+use std::fmt::Debug;
 
-pub type DataSource = Arc<dyn TransactableStorage>;
-pub type Value = Arc<Vec<u8>>;
-pub type KVItem = DatabaseResult<(Vec<u8>, Value)>;
+pub mod data_source;
+pub mod generic_database;
+#[cfg(feature = "rocksdb")]
+pub mod historical_rocksdb;
+pub mod in_memory;
+pub mod iterable_key_value_view;
+pub mod key_value_view;
+#[cfg(feature = "rocksdb")]
+pub mod rocks_db;
+#[cfg(feature = "rocksdb")]
+pub mod rocks_db_key_iterator;
 
-pub trait KeyValueStore {
-    fn put(
-        &self,
-        key: &[u8],
-        column: Column,
-        value: Value,
-    ) -> DatabaseResult<Option<Value>>;
+pub type ColumnType<Description> = <Description as DatabaseDescription>::Column;
 
-    fn write(&self, key: &[u8], column: Column, buf: &[u8]) -> DatabaseResult<usize>;
+/// A type extends the `KeyValueView`, allowing iteration over the storage.
+pub type IterableKeyValueView<Column> =
+    GenericDatabase<IterableKeyValueViewWrapper<Column>>;
 
-    fn replace(
-        &self,
-        key: &[u8],
-        column: Column,
-        buf: &[u8],
-    ) -> DatabaseResult<(usize, Option<Value>)>;
+/// The basic view available for the key value storage.
+pub type KeyValueView<Column> = GenericDatabase<KeyValueViewWrapper<Column>>;
 
-    fn take(&self, key: &[u8], column: Column) -> DatabaseResult<Option<Value>>;
-
-    fn delete(&self, key: &[u8], column: Column) -> DatabaseResult<Option<Value>>;
-
-    fn exists(&self, key: &[u8], column: Column) -> DatabaseResult<bool>;
-
-    fn size_of_value(&self, key: &[u8], column: Column) -> DatabaseResult<Option<usize>>;
-
-    fn get(&self, key: &[u8], column: Column) -> DatabaseResult<Option<Value>>;
-
-    fn read(
-        &self,
-        key: &[u8],
-        column: Column,
-        buf: &mut [u8],
-    ) -> DatabaseResult<Option<usize>>;
-
-    fn read_alloc(&self, key: &[u8], column: Column) -> DatabaseResult<Option<Value>>;
-
-    fn iter_all(
-        &self,
-        column: Column,
-        prefix: Option<&[u8]>,
-        start: Option<&[u8]>,
-        direction: IterDirection,
-    ) -> BoxedIter<KVItem>;
-}
-
-pub trait BatchOperations: KeyValueStore {
-    fn batch_write(
-        &self,
-        entries: &mut dyn Iterator<Item = (Vec<u8>, Column, WriteOperation)>,
-    ) -> DatabaseResult<()> {
-        for (key, column, op) in entries {
-            match op {
-                // TODO: error handling
-                WriteOperation::Insert(value) => {
-                    let _ = self.put(&key, column, value);
-                }
-                WriteOperation::Remove => {
-                    let _ = self.delete(&key, column);
-                }
-            }
-        }
-        Ok(())
+impl<Column> IterableKeyValueView<Column>
+where
+    Column: StorageColumn + 'static,
+{
+    /// Downgrades the `IterableKeyValueView` into the `KeyValueView`.
+    pub fn into_key_value_view(self) -> KeyValueView<Column> {
+        let iterable = self.into_inner();
+        let storage = KeyValueViewWrapper::new(iterable);
+        KeyValueView::from_storage(storage)
     }
 }
 
-#[derive(Debug)]
-pub enum WriteOperation {
-    Insert(Value),
-    Remove,
+pub trait TransactableStorage<Height>: IterableStore + Debug + Send + Sync {
+    /// Commits the changes into the storage.
+    fn commit_changes(
+        &self,
+        height: Option<Height>,
+        changes: Changes,
+    ) -> StorageResult<()>;
+
+    fn view_at_height(
+        &self,
+        height: &Height,
+    ) -> StorageResult<KeyValueView<Self::Column>>;
+
+    fn latest_view(&self) -> StorageResult<IterableKeyValueView<Self::Column>>;
+
+    fn rollback_block_to(&self, height: &Height) -> StorageResult<()>;
 }
 
-pub trait TransactableStorage: BatchOperations + Debug + Send + Sync {}
+// It is used only to allow conversion of the `StorageTransaction` into the `DataSource`.
+#[cfg(feature = "test-helpers")]
+impl<Height, S> TransactableStorage<Height>
+    for fuel_core_storage::transactional::StorageTransaction<S>
+where
+    S: IterableStore + Debug + Send + Sync,
+{
+    fn commit_changes(&self, _: Option<Height>, _: Changes) -> StorageResult<()> {
+        unimplemented!()
+    }
 
-pub mod in_memory;
-#[cfg(feature = "rocksdb")]
-pub mod rocks_db;
+    fn view_at_height(&self, _: &Height) -> StorageResult<KeyValueView<Self::Column>> {
+        unimplemented!()
+    }
+
+    fn latest_view(&self) -> StorageResult<IterableKeyValueView<Self::Column>> {
+        unimplemented!()
+    }
+
+    fn rollback_block_to(&self, _: &Height) -> StorageResult<()> {
+        unimplemented!()
+    }
+}

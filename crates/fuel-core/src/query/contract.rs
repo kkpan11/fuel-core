@@ -1,13 +1,8 @@
-use crate::graphql_api::ports::DatabasePort;
+use crate::fuel_core_graphql_api::database::ReadView;
 use fuel_core_storage::{
-    iter::{
-        BoxedIter,
-        IterDirection,
-    },
     not_found,
     tables::{
         ContractsAssets,
-        ContractsInfo,
         ContractsRawCode,
     },
     Result as StorageResult,
@@ -18,43 +13,21 @@ use fuel_core_types::{
         AssetId,
         ContractId,
     },
-    fuel_vm::Salt,
     services::graphql_api::ContractBalance,
 };
 
-pub trait ContractQueryData: Send + Sync {
-    fn contract_id(&self, id: ContractId) -> StorageResult<ContractId>;
-
-    fn contract_bytecode(&self, id: ContractId) -> StorageResult<Vec<u8>>;
-
-    fn contract_salt(&self, id: ContractId) -> StorageResult<Salt>;
-
-    fn contract_balance(
-        &self,
-        contract_id: ContractId,
-        asset_id: AssetId,
-    ) -> StorageResult<ContractBalance>;
-
-    fn contract_balances(
-        &self,
-        contract_id: ContractId,
-        start_asset: Option<AssetId>,
-        direction: IterDirection,
-    ) -> BoxedIter<StorageResult<ContractBalance>>;
-}
-
-impl<D: DatabasePort + ?Sized> ContractQueryData for D {
-    fn contract_id(&self, id: ContractId) -> StorageResult<ContractId> {
-        let contract_exists = self.storage::<ContractsRawCode>().contains_key(&id)?;
-        if contract_exists {
-            Ok(id)
-        } else {
-            Err(not_found!(ContractsRawCode))
-        }
+impl ReadView {
+    pub fn contract_exists(&self, id: ContractId) -> StorageResult<bool> {
+        self.on_chain
+            .as_ref()
+            .storage::<ContractsRawCode>()
+            .contains_key(&id)
     }
 
-    fn contract_bytecode(&self, id: ContractId) -> StorageResult<Vec<u8>> {
+    pub fn contract_bytecode(&self, id: ContractId) -> StorageResult<Vec<u8>> {
         let contract = self
+            .on_chain
+            .as_ref()
             .storage::<ContractsRawCode>()
             .get(&id)?
             .ok_or(not_found!(ContractsRawCode))?
@@ -63,22 +36,14 @@ impl<D: DatabasePort + ?Sized> ContractQueryData for D {
         Ok(contract.into())
     }
 
-    fn contract_salt(&self, id: ContractId) -> StorageResult<Salt> {
-        let (salt, _) = self
-            .storage::<ContractsInfo>()
-            .get(&id)?
-            .ok_or(not_found!(ContractsInfo))?
-            .into_owned();
-
-        Ok(salt)
-    }
-
-    fn contract_balance(
+    pub fn contract_balance(
         &self,
         contract_id: ContractId,
         asset_id: AssetId,
     ) -> StorageResult<ContractBalance> {
         let amount = self
+            .on_chain
+            .as_ref()
             .storage::<ContractsAssets>()
             .get(&(&contract_id, &asset_id).into())?
             .ok_or(not_found!(ContractsAssets))?
@@ -89,14 +54,5 @@ impl<D: DatabasePort + ?Sized> ContractQueryData for D {
             amount,
             asset_id,
         })
-    }
-
-    fn contract_balances(
-        &self,
-        contract_id: ContractId,
-        start_asset: Option<AssetId>,
-        direction: IterDirection,
-    ) -> BoxedIter<StorageResult<ContractBalance>> {
-        self.contract_balances(contract_id, start_asset, direction)
     }
 }

@@ -1,17 +1,6 @@
 use clap::ValueEnum;
-use fuel_core_chain_config::{
-    default_consensus_dev_key,
-    ChainConfig,
-};
-use fuel_core_types::{
-    blockchain::primitives::SecretKeyWrapper,
-    secrecy::Secret,
-};
 use std::{
-    net::{
-        Ipv4Addr,
-        SocketAddr,
-    },
+    num::NonZeroU64,
     path::PathBuf,
     time::Duration,
 };
@@ -21,24 +10,42 @@ use strum_macros::{
     EnumVariantNames,
 };
 
+use fuel_core_chain_config::SnapshotReader;
+#[cfg(feature = "test-helpers")]
+use fuel_core_chain_config::{
+    ChainConfig,
+    StateConfig,
+};
+pub use fuel_core_consensus_module::RelayerConsensusConfig;
+pub use fuel_core_importer;
 #[cfg(feature = "p2p")]
 use fuel_core_p2p::config::{
     Config as P2PConfig,
     NotInitialized,
 };
-
+pub use fuel_core_poa::Trigger;
 #[cfg(feature = "relayer")]
 use fuel_core_relayer::Config as RelayerConfig;
+use fuel_core_txpool::config::Config as TxPoolConfig;
+use fuel_core_types::{
+    blockchain::header::StateTransitionBytecodeVersion,
+    signer::SignMode,
+};
 
-pub use fuel_core_poa::Trigger;
+use crate::{
+    combined_database::CombinedDatabaseConfig,
+    graphql_api::{
+        worker_service::DaCompressionConfig,
+        ServiceConfig as GraphQLConfig,
+    },
+};
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub addr: SocketAddr,
-    pub max_database_cache_size: usize,
-    pub database_path: PathBuf,
-    pub database_type: DbType,
-    pub chain_conf: ChainConfig,
+    pub graphql_config: GraphQLConfig,
+    pub combined_db_config: CombinedDatabaseConfig,
+    pub snapshot_reader: SnapshotReader,
+    pub continue_on_error: bool,
     /// When `true`:
     /// - Enables manual block production.
     /// - Enables debugger endpoint.
@@ -46,11 +53,19 @@ pub struct Config {
     pub debug: bool,
     // default to false until downstream consumers stabilize
     pub utxo_validation: bool,
+    pub native_executor_version: Option<StateTransitionBytecodeVersion>,
     pub block_production: Trigger,
+    pub predefined_blocks_path: Option<PathBuf>,
     pub vm: VMConfig,
-    pub txpool: fuel_core_txpool::Config,
+    pub txpool: TxPoolConfig,
     pub block_producer: fuel_core_producer::Config,
-    pub block_executor: fuel_core_executor::Config,
+    pub starting_exec_gas_price: u64,
+    pub exec_gas_price_change_percent: u16,
+    pub min_exec_gas_price: u64,
+    pub exec_gas_price_threshold_percent: u8,
+    pub da_committer_url: Option<url::Url>,
+    pub da_poll_interval: Option<Duration>,
+    pub da_compression: DaCompressionConfig,
     pub block_importer: fuel_core_importer::Config,
     #[cfg(feature = "relayer")]
     pub relayer: Option<RelayerConfig>,
@@ -58,59 +73,153 @@ pub struct Config {
     pub p2p: Option<P2PConfig<NotInitialized>>,
     #[cfg(feature = "p2p")]
     pub sync: fuel_core_sync::Config,
-    pub consensus_key: Option<Secret<SecretKeyWrapper>>,
+    #[cfg(feature = "shared-sequencer")]
+    pub shared_sequencer: fuel_core_shared_sequencer::Config,
+    pub consensus_signer: SignMode,
     pub name: String,
-    pub verifier: fuel_core_consensus_module::RelayerVerifierConfig,
+    pub relayer_consensus_config: fuel_core_consensus_module::RelayerConsensusConfig,
     /// The number of reserved peers to connect to before starting to sync.
     pub min_connected_reserved_peers: usize,
     /// Time to wait after receiving the latest block before considered to be Synced.
     pub time_until_synced: Duration,
-    /// Time to wait after submitting a query before debug info will be logged about query.
-    pub query_log_threshold_time: Duration,
+    /// The size of the memory pool in number of `MemoryInstance`s.
+    pub memory_pool_size: usize,
+    pub da_gas_price_factor: NonZeroU64,
+    pub starting_recorded_height: Option<u32>,
+    pub min_da_gas_price: u64,
+    pub max_da_gas_price: u64,
+    pub max_da_gas_price_change_percent: u16,
+    pub da_gas_price_p_component: i64,
+    pub da_gas_price_d_component: i64,
+    pub activity_normal_range_size: u16,
+    pub activity_capped_range_size: u16,
+    pub activity_decrease_range_size: u16,
+    pub block_activity_threshold: u8,
 }
 
 impl Config {
+    #[cfg(feature = "test-helpers")]
     pub fn local_node() -> Self {
-        let chain_conf = ChainConfig::local_testnet();
-        let utxo_validation = false;
-        let min_gas_price = 0;
+        Self::local_node_with_state_config(StateConfig::local_testnet())
+    }
 
-        Self {
-            addr: SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 0),
-            // Set the cache for tests = 10MB
-            max_database_cache_size: 10 * 1024 * 1024,
+    #[cfg(feature = "test-helpers")]
+    pub fn local_node_with_state_config(state_config: StateConfig) -> Self {
+        Self::local_node_with_configs(ChainConfig::local_testnet(), state_config)
+    }
+
+    #[cfg(feature = "test-helpers")]
+    pub fn local_node_with_configs(
+        chain_config: ChainConfig,
+        state_config: StateConfig,
+    ) -> Self {
+        Self::local_node_with_reader(SnapshotReader::new_in_memory(
+            chain_config,
+            state_config,
+        ))
+    }
+
+    #[cfg(feature = "test-helpers")]
+    pub fn local_node_with_reader(snapshot_reader: SnapshotReader) -> Self {
+        let block_importer = fuel_core_importer::Config::new(false);
+        let latest_block = snapshot_reader.last_block_config();
+        // In tests, we always want to use the native executor as a default configuration.
+        let native_executor_version = latest_block
+            .map(|last_block| last_block.state_transition_version.saturating_add(1))
+            .unwrap_or(
+                fuel_core_types::blockchain::header::LATEST_STATE_TRANSITION_VERSION,
+            );
+
+        let utxo_validation = false;
+
+        let combined_db_config = CombinedDatabaseConfig {
+            #[cfg(feature = "rocksdb")]
+            database_config: crate::state::rocks_db::DatabaseConfig::config_for_tests(),
             database_path: Default::default(),
             #[cfg(feature = "rocksdb")]
             database_type: DbType::RocksDb,
             #[cfg(not(feature = "rocksdb"))]
             database_type: DbType::InMemory,
-            debug: true,
-            chain_conf: chain_conf.clone(),
-            block_production: Trigger::Instant,
-            vm: Default::default(),
-            utxo_validation,
-            txpool: fuel_core_txpool::Config {
-                chain_config: chain_conf,
-                min_gas_price,
-                utxo_validation,
-                transaction_ttl: Duration::from_secs(60 * 100000000),
-                ..fuel_core_txpool::Config::default()
+            #[cfg(feature = "rocksdb")]
+            state_rewind_policy:
+                crate::state::historical_rocksdb::StateRewindPolicy::RewindFullRange,
+        };
+        let starting_gas_price = 0;
+        let gas_price_change_percent = 0;
+        let min_gas_price = 0;
+        let gas_price_threshold_percent = 50;
+
+        Self {
+            graphql_config: GraphQLConfig {
+                addr: std::net::SocketAddr::new(
+                    std::net::Ipv4Addr::new(127, 0, 0, 1).into(),
+                    0,
+                ),
+                number_of_threads: 0,
+                database_batch_size: 100,
+                max_queries_depth: 16,
+                max_queries_complexity: 80000,
+                max_queries_recursive_depth: 16,
+                max_queries_resolver_recursive_depth: 1,
+                max_queries_directives: 10,
+                max_concurrent_queries: 1024,
+                request_body_bytes_limit: 16 * 1024 * 1024,
+                query_log_threshold_time: Duration::from_secs(2),
+                api_request_timeout: Duration::from_secs(60),
+                costs: Default::default(),
             },
-            block_producer: Default::default(),
-            block_executor: Default::default(),
-            block_importer: Default::default(),
+            combined_db_config,
+            continue_on_error: false,
+            debug: true,
+            utxo_validation,
+            native_executor_version: Some(native_executor_version),
+            snapshot_reader,
+            block_production: Trigger::Instant,
+            predefined_blocks_path: None,
+            vm: Default::default(),
+            txpool: TxPoolConfig {
+                utxo_validation,
+                max_txs_ttl: Duration::from_secs(60 * 100000000),
+                ..Default::default()
+            },
+            block_producer: fuel_core_producer::Config {
+                ..Default::default()
+            },
+            da_compression: DaCompressionConfig::Disabled,
+            starting_exec_gas_price: starting_gas_price,
+            exec_gas_price_change_percent: gas_price_change_percent,
+            min_exec_gas_price: min_gas_price,
+            exec_gas_price_threshold_percent: gas_price_threshold_percent,
+            block_importer,
             #[cfg(feature = "relayer")]
             relayer: None,
             #[cfg(feature = "p2p")]
             p2p: Some(P2PConfig::<NotInitialized>::default("test_network")),
             #[cfg(feature = "p2p")]
             sync: fuel_core_sync::Config::default(),
-            consensus_key: Some(Secret::new(default_consensus_dev_key().into())),
+            #[cfg(feature = "shared-sequencer")]
+            shared_sequencer: fuel_core_shared_sequencer::Config::local_node(),
+            consensus_signer: SignMode::Key(fuel_core_types::secrecy::Secret::new(
+                fuel_core_chain_config::default_consensus_dev_key().into(),
+            )),
             name: String::default(),
-            verifier: Default::default(),
+            relayer_consensus_config: Default::default(),
             min_connected_reserved_peers: 0,
             time_until_synced: Duration::ZERO,
-            query_log_threshold_time: Duration::from_secs(2),
+            memory_pool_size: 4,
+            da_gas_price_factor: NonZeroU64::new(100).expect("100 is not zero"),
+            starting_recorded_height: None,
+            min_da_gas_price: 0,
+            max_da_gas_price: 1,
+            max_da_gas_price_change_percent: 0,
+            da_gas_price_p_component: 0,
+            da_gas_price_d_component: 0,
+            activity_normal_range_size: 0,
+            activity_capped_range_size: 0,
+            activity_decrease_range_size: 0,
+            da_committer_url: None,
+            block_activity_threshold: 0,
+            da_poll_interval: Some(Duration::from_secs(1)),
         }
     }
 
@@ -123,17 +232,9 @@ impl Config {
             self.utxo_validation = true;
         }
 
-        if self.txpool.chain_config != self.chain_conf {
-            tracing::warn!("The `ChainConfig` of `TxPool` was inconsistent");
-            self.txpool.chain_config = self.chain_conf.clone();
-        }
         if self.txpool.utxo_validation != self.utxo_validation {
             tracing::warn!("The `utxo_validation` of `TxPool` was inconsistent");
             self.txpool.utxo_validation = self.utxo_validation;
-        }
-        if self.block_producer.utxo_validation != self.utxo_validation {
-            tracing::warn!("The `utxo_validation` of `BlockProducer` was inconsistent");
-            self.block_producer.utxo_validation = self.utxo_validation;
         }
 
         self
@@ -144,12 +245,15 @@ impl From<&Config> for fuel_core_poa::Config {
     fn from(config: &Config) -> Self {
         fuel_core_poa::Config {
             trigger: config.block_production,
-            block_gas_limit: config.chain_conf.block_gas_limit,
-            signing_key: config.consensus_key.clone(),
+            signer: config.consensus_signer.clone(),
             metrics: false,
-            consensus_params: config.chain_conf.consensus_parameters.clone(),
             min_connected_reserved_peers: config.min_connected_reserved_peers,
             time_until_synced: config.time_until_synced,
+            chain_id: config
+                .snapshot_reader
+                .chain_config()
+                .consensus_parameters
+                .chain_id(),
         }
     }
 }
@@ -160,7 +264,7 @@ pub struct VMConfig {
 }
 
 #[derive(
-    Clone, Debug, Display, Eq, PartialEq, EnumString, EnumVariantNames, ValueEnum,
+    Clone, Copy, Debug, Display, Eq, PartialEq, EnumString, EnumVariantNames, ValueEnum,
 )]
 #[strum(serialize_all = "kebab_case")]
 pub enum DbType {

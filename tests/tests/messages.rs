@@ -21,6 +21,7 @@ use fuel_core_client::client::{
     },
     FuelClient,
 };
+use fuel_core_storage::tables::Coins;
 use fuel_core_types::{
     fuel_asm::{
         op,
@@ -36,11 +37,20 @@ use fuel_core_types::{
     },
     fuel_types::ChainId,
 };
+use itertools::Itertools;
 use rstest::rstest;
 use std::ops::Deref;
 
-#[cfg(feature = "relayer")]
 mod relayer;
+
+fn setup_config(messages: impl IntoIterator<Item = MessageConfig>) -> Config {
+    let state = StateConfig {
+        messages: messages.into_iter().collect_vec(),
+        ..Default::default()
+    };
+
+    Config::local_node_with_state_config(state)
+}
 
 #[tokio::test]
 async fn messages_returns_messages_for_all_owners() {
@@ -68,11 +78,7 @@ async fn messages_returns_messages_for_all_owners() {
     };
 
     // configure the messages
-    let mut config = Config::local_node();
-    config.chain_conf.initial_state = Some(StateConfig {
-        messages: Some(vec![first_msg, second_msg, third_msg]),
-        ..Default::default()
-    });
+    let config = setup_config(vec![first_msg, second_msg, third_msg]);
 
     // setup server & client
     let srv = FuelService::new_node(config).await.unwrap();
@@ -116,12 +122,7 @@ async fn messages_by_owner_returns_messages_for_the_given_owner() {
         ..Default::default()
     };
 
-    // configure the messages
-    let mut config = Config::local_node();
-    config.chain_conf.initial_state = Some(StateConfig {
-        messages: Some(vec![first_msg, second_msg, third_msg]),
-        ..Default::default()
-    });
+    let config = setup_config(vec![first_msg, second_msg, third_msg]);
 
     // setup server & client
     let srv = FuelService::new_node(config).await.unwrap();
@@ -172,9 +173,7 @@ async fn messages_by_owner_returns_messages_for_the_given_owner() {
 #[rstest]
 #[tokio::test]
 async fn messages_empty_results_for_owner_with_no_messages(
-    #[values(PageDirection::Forward)] direction: PageDirection,
-    //#[values(PageDirection::Forward, PageDirection::Backward)] direction: PageDirection,
-    // reverse iteration with prefix not supported by rocksdb
+    #[values(PageDirection::Forward, PageDirection::Backward)] direction: PageDirection,
     #[values(Address::new([16; 32]), Address::new([0; 32]))] owner: Address,
 ) {
     let srv = FuelService::new_node(Config::local_node()).await.unwrap();
@@ -205,11 +204,7 @@ async fn message_status__can_get_unspent() {
         ..Default::default()
     };
 
-    let mut config = Config::local_node();
-    config.chain_conf.initial_state = Some(StateConfig {
-        messages: Some(vec![msg]),
-        ..Default::default()
-    });
+    let config = setup_config(vec![msg]);
 
     let srv = FuelService::new_node(config).await.unwrap();
     let client = FuelClient::from(srv.bound_address);
@@ -239,11 +234,7 @@ async fn message_status__can_get_spent() {
         ..Default::default()
     };
 
-    let mut config = Config::local_node();
-    config.chain_conf.initial_state = Some(StateConfig {
-        messages: Some(vec![msg]),
-        ..Default::default()
-    });
+    let config = setup_config(vec![msg]);
 
     let srv = FuelService::new_node(config).await.unwrap();
     let client = FuelClient::from(srv.bound_address);
@@ -259,11 +250,10 @@ async fn message_status__can_get_spent() {
     let output = Output::coin(output_recipient, amount, Default::default());
 
     let tx = Transaction::script(
-        Default::default(),
         1_000_000,
-        Default::default(),
         vec![],
         vec![],
+        policies::Policies::new().with_max_fee(0),
         vec![input],
         vec![output],
         vec![Vec::new().into()],
@@ -301,15 +291,14 @@ async fn can_get_message_proof() {
         let config = Config::local_node();
 
         let coin = config
-            .chain_conf
-            .initial_state
-            .as_ref()
+            .snapshot_reader
+            .read::<Coins>()
             .unwrap()
-            .coins
-            .as_ref()
+            .into_iter()
+            .next()
             .unwrap()
-            .first()
-            .unwrap()
+            .unwrap()[0]
+            .value
             .clone();
 
         struct MessageArgs {
@@ -365,7 +354,7 @@ async fn can_get_message_proof() {
 
         // Create the contract deploy transaction.
         let mut contract_deploy = TransactionBuilder::create(bytecode, salt, vec![])
-            .add_random_fee_input()
+            .add_fee_input()
             .add_output(output)
             .finalize_as_transaction();
 
@@ -408,14 +397,13 @@ async fn can_get_message_proof() {
             .collect();
 
         let predicate = op::ret(RegId::ONE).to_bytes().to_vec();
-        let owner = Input::predicate_owner(&predicate, &ChainId::default());
+        let owner = Input::predicate_owner(&predicate);
         let coin_input = Input::coin_predicate(
             Default::default(),
             owner,
             1000,
-            coin.asset_id,
+            *coin.asset_id(),
             TxPointer::default(),
-            Default::default(),
             Default::default(),
             predicate,
             vec![],
@@ -434,19 +422,14 @@ async fn can_get_message_proof() {
         ];
 
         // The transaction will output a contract output and message output.
-        let outputs = vec![Output::Contract {
-            input_index: 0,
-            balance_root: Bytes32::zeroed(),
-            state_root: Bytes32::zeroed(),
-        }];
+        let outputs = vec![Output::contract(0, Bytes32::zeroed(), Bytes32::zeroed())];
 
         // Create the contract calling script.
         let script = Transaction::script(
-            Default::default(),
             1_000_000,
-            Default::default(),
             script,
             script_data,
+            policies::Policies::new().with_max_fee(0),
             inputs,
             outputs,
             vec![],
@@ -501,7 +484,6 @@ async fn can_get_message_proof() {
             let result = client
                 .message_proof(&transaction_id, nonce, None, Some(last_height))
                 .await
-                .unwrap()
                 .unwrap();
 
             // 1. Generate the message id (message fields)
@@ -533,11 +515,11 @@ async fn can_get_message_proof() {
                 .map(Bytes32::from)
                 .collect();
             assert!(verify_merkle(
-                result.message_block_header.message_receipt_root,
+                result.message_block_header.message_outbox_root,
                 &generated_message_id,
                 message_proof_index,
                 &message_proof_set,
-                result.message_block_header.message_receipt_count,
+                result.message_block_header.message_receipt_count as u64,
             ));
 
             // Generate a proof to compare
@@ -553,7 +535,7 @@ async fn can_get_message_proof() {
 
             // Check the root matches the proof and the root on the header.
             assert_eq!(
-                <[u8; 32]>::from(result.message_block_header.message_receipt_root),
+                <[u8; 32]>::from(result.message_block_header.message_outbox_root),
                 expected_root
             );
 
@@ -588,4 +570,46 @@ fn verify_merkle<D: AsRef<[u8]>>(
 ) -> bool {
     let set: Vec<_> = set.iter().map(|bytes| *bytes.deref()).collect();
     fuel_merkle::binary::verify(root.deref(), data, &set, index, leaf_count)
+}
+
+#[tokio::test]
+async fn can_get_message() {
+    // create an owner
+    let owner = Address::new([1; 32]);
+
+    // create some messages for the owner
+    let first_msg = MessageConfig {
+        recipient: owner,
+        nonce: 1.into(),
+        ..Default::default()
+    };
+
+    // configure the messages
+    let state_config = StateConfig {
+        messages: vec![first_msg.clone()],
+        ..Default::default()
+    };
+    let config = Config::local_node_with_state_config(state_config);
+
+    // setup service and client
+    let service = FuelService::new_node(config).await.unwrap();
+    let client = FuelClient::from(service.bound_address);
+
+    // run test
+    let message_response = client.message(&first_msg.nonce).await.unwrap();
+    assert!(message_response.is_some());
+    if let Some(message_response) = message_response {
+        assert_eq!(message_response.nonce, first_msg.nonce);
+    }
+}
+
+#[tokio::test]
+async fn can_get_empty_message() {
+    let config = Config::local_node_with_state_config(StateConfig::default());
+
+    let service = FuelService::new_node(config).await.unwrap();
+    let client = FuelClient::from(service.bound_address);
+
+    let message_response = client.message(&1.into()).await.unwrap();
+    assert!(message_response.is_none());
 }

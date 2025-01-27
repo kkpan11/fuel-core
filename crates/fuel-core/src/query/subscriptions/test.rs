@@ -19,7 +19,10 @@
 //! - `tx_status_message()`: Generates a TxStatusMessage
 //! - `transaction_status()`: Generates a TransactionStatus
 //! - `input_stream()`: Generates a Vec<TxStatusMessage> of length 0 to 5
-use fuel_core_txpool::service::TxStatusMessage;
+use fuel_core_txpool::{
+    error::RemovedReason,
+    TxStatusMessage,
+};
 use fuel_core_types::{
     fuel_types::Bytes32,
     services::txpool::TransactionStatus,
@@ -52,26 +55,31 @@ fn submitted() -> TransactionStatus {
 /// Returns a TransactionStatus with Success status, time set to 0, and result set to None
 fn success() -> TransactionStatus {
     TransactionStatus::Success {
-        block_id: Default::default(),
+        block_height: Default::default(),
         time: Tai64(0),
         result: None,
+        receipts: vec![],
+        total_gas: 0,
+        total_fee: 0,
     }
 }
 
 /// Returns a TransactionStatus with Failed status, time set to 0, result set to None, and empty reason
 fn failed() -> TransactionStatus {
     TransactionStatus::Failed {
-        block_id: Default::default(),
+        block_height: Default::default(),
         time: Tai64(0),
         result: None,
-        reason: Default::default(),
+        receipts: vec![],
+        total_gas: 0,
+        total_fee: 0,
     }
 }
 
 /// Returns a TransactionStatus with SqueezedOut status and an empty error message
 fn squeezed() -> TransactionStatus {
     TransactionStatus::SqueezedOut {
-        reason: fuel_core_txpool::Error::SqueezedOut(String::new()).to_string(),
+        reason: fuel_core_txpool::error::Error::Removed(RemovedReason::Ttl).to_string(),
     }
 }
 

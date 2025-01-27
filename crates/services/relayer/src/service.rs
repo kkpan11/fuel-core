@@ -13,37 +13,32 @@ use ethers_core::types::{
     Log,
     SyncingStatus,
     ValueOrArray,
-    H160,
 };
 use ethers_providers::{
     Http,
     Middleware,
     Provider,
     ProviderError,
+    Quorum,
+    QuorumProvider,
+    WeightedProvider,
 };
 use fuel_core_services::{
     RunnableService,
     RunnableTask,
     ServiceRunner,
     StateWatcher,
-};
-use fuel_core_storage::{
-    tables::Messages,
-    StorageAsRef,
-    StorageInspect,
+    TaskNextAction,
 };
 use fuel_core_types::{
     blockchain::primitives::DaBlockHeight,
-    entities::message::Message,
-    fuel_types::Nonce,
+    entities::Message,
 };
 use futures::StreamExt;
 use std::{
-    borrow::Cow,
     convert::TryInto,
     ops::Deref,
 };
-use synced::update_synced;
 use tokio::sync::watch;
 
 use self::{
@@ -54,7 +49,6 @@ use self::{
 mod get_logs;
 mod run;
 mod state;
-mod synced;
 mod syncing;
 
 #[cfg(test)]
@@ -64,7 +58,7 @@ type Synced = watch::Receiver<Option<DaBlockHeight>>;
 type NotifySynced = watch::Sender<Option<DaBlockHeight>>;
 
 /// The alias of runnable relayer service.
-pub type Service<D> = CustomizableService<Provider<Http>, D>;
+pub type Service<D> = CustomizableService<Provider<QuorumProvider<Http>>, D>;
 type CustomizableService<P, D> = ServiceRunner<NotInitializedTask<P, D>>;
 
 /// The shared state of the relayer task.
@@ -72,6 +66,7 @@ type CustomizableService<P, D> = ServiceRunner<NotInitializedTask<P, D>>;
 pub struct SharedState<D> {
     /// Receives signals when the relayer reaches consistency with the DA layer.
     synced: Synced,
+    start_da_block_height: DaBlockHeight,
     database: D,
 }
 
@@ -85,6 +80,8 @@ pub struct NotInitializedTask<P, D> {
     database: D,
     /// Configuration settings.
     config: Config,
+    /// Retry on error
+    retry_on_error: bool,
 }
 
 /// The actual relayer background task that syncs with the DA layer.
@@ -100,29 +97,21 @@ pub struct Task<P, D> {
     /// The watcher used to track the state of the service. If the service stops,
     /// the task will stop synchronization.
     shutdown: StateWatcher,
+    /// Retry on error
+    retry_on_error: bool,
 }
 
 impl<P, D> NotInitializedTask<P, D> {
     /// Create a new relayer task.
-    fn new(eth_node: P, database: D, config: Config) -> Self {
+    fn new(eth_node: P, database: D, config: Config, retry_on_error: bool) -> Self {
         let (synced, _) = watch::channel(None);
         Self {
             synced,
             eth_node,
             database,
             config,
+            retry_on_error,
         }
-    }
-}
-
-impl<P, D> Task<P, D>
-where
-    D: RelayerDb + 'static,
-{
-    fn set_deploy_height(&mut self) {
-        self.database
-            .set_finalized_da_height_to_at_least(&self.config.da_deploy_height)
-            .expect("Should be able to set the finalized da height");
     }
 }
 
@@ -160,11 +149,19 @@ where
             self.config.log_page_size,
         );
         let logs = logs.take_until(self.shutdown.while_started());
+
         write_logs(&mut self.database, logs).await
     }
 
     fn update_synced(&self, state: &state::EthState) {
-        update_synced(&self.synced, state)
+        self.synced.send_if_modified(|last_state| {
+            if let Some(val) = state.is_synced_at() {
+                *last_state = Some(DaBlockHeight::from(val));
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 
@@ -185,6 +182,7 @@ where
 
         SharedState {
             synced,
+            start_da_block_height: self.config.da_deploy_height,
             database: self.database.clone(),
         }
     }
@@ -200,15 +198,16 @@ where
             eth_node,
             database,
             config,
+            retry_on_error,
         } = self;
-        let mut task = Task {
+        let task = Task {
             synced,
             eth_node,
             database,
             config,
             shutdown,
+            retry_on_error,
         };
-        task.set_deploy_height();
 
         Ok(task)
     }
@@ -220,9 +219,8 @@ where
     P: Middleware<Error = ProviderError> + 'static,
     D: RelayerDb + 'static,
 {
-    async fn run(&mut self, _: &mut StateWatcher) -> anyhow::Result<bool> {
+    async fn run(&mut self, _: &mut StateWatcher) -> TaskNextAction {
         let now = tokio::time::Instant::now();
-        let should_continue = true;
 
         let result = run::run(self).await;
 
@@ -238,7 +236,16 @@ where
             .await;
         }
 
-        result.map(|_| should_continue)
+        if let Err(err) = result {
+            if !self.retry_on_error {
+                tracing::error!("Exiting due to Error in relayer task: {:?}", err);
+                TaskNextAction::Stop
+            } else {
+                TaskNextAction::ErrorContinue(err)
+            }
+        } else {
+            TaskNextAction::Continue
+        }
     }
 
     async fn shutdown(self) -> anyhow::Result<()> {
@@ -249,7 +256,7 @@ where
 }
 
 impl<D> SharedState<D> {
-    /// Wait for the [`Task`] to be in sync with
+    /// Wait for the `Task` to be in sync with
     /// the data availability layer.
     ///
     /// Yields until the relayer reaches a point where it
@@ -280,31 +287,20 @@ impl<D> SharedState<D> {
         Ok(())
     }
 
-    /// Get a message if it has been synced
-    /// and is <= the given height.
-    pub fn get_message(
-        &self,
-        id: &Nonce,
-        da_height: &DaBlockHeight,
-    ) -> anyhow::Result<Option<Message>>
-    where
-        D: StorageInspect<Messages, Error = fuel_core_storage::Error>,
-    {
-        Ok(self
-            .database
-            .storage::<Messages>()
-            .get(id)?
-            .map(Cow::into_owned)
-            .filter(|message| message.da_height <= *da_height))
-    }
-
     /// Get finalized da height that represents last block from da layer that got finalized.
     /// Panics if height is not set as of initialization of the relayer.
-    pub fn get_finalized_da_height(&self) -> anyhow::Result<DaBlockHeight>
+    pub fn get_finalized_da_height(&self) -> DaBlockHeight
     where
         D: RelayerDb + 'static,
     {
-        Ok(self.database.get_finalized_da_height()?)
+        self.database
+            .get_finalized_da_height()
+            .unwrap_or(self.start_da_block_height)
+    }
+
+    /// Getter for database field
+    pub fn database(&self) -> &D {
+        &self.database
     }
 }
 
@@ -322,7 +318,7 @@ where
                 Err(anyhow::anyhow!("The relayer got a stop signal"))
             },
             block = self.eth_node.get_block(ethers_core::types::BlockNumber::Finalized) => {
-                let block_number = block?
+                let block_number = block.map_err(anyhow::Error::msg)?
                     .and_then(|block| block.number)
                     .ok_or(anyhow::anyhow!("Block pending"))?
                     .as_u64();
@@ -339,7 +335,12 @@ where
     D: RelayerDb + 'static,
 {
     fn observed(&self) -> Option<u64> {
-        self.database.get_finalized_da_height().map(|h| *h).ok()
+        Some(
+            self.database
+                .get_finalized_da_height()
+                .map(|h| h.into())
+                .unwrap_or(self.config.da_deploy_height.0),
+        )
     }
 }
 
@@ -348,15 +349,25 @@ pub fn new_service<D>(database: D, config: Config) -> anyhow::Result<Service<D>>
 where
     D: RelayerDb + Clone + 'static,
 {
-    let url = config.relayer.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Tried to start Relayer without setting an eth_client in the config"
-        )
-    })?;
-    // TODO: Does this handle https?
-    let http = Http::new(url);
-    let eth_node = Provider::new(http);
-    Ok(new_service_internal(eth_node, database, config))
+    let urls = config
+        .relayer
+        .clone()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Tried to start Relayer without setting an eth_client in the config"
+            )
+        })?
+        .into_iter()
+        .map(|url| WeightedProvider::new(Http::new(url)));
+
+    let eth_node = Provider::new(QuorumProvider::new(Quorum::Majority, urls));
+    let retry_on_error = true;
+    Ok(new_service_internal(
+        eth_node,
+        database,
+        config,
+        retry_on_error,
+    ))
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -370,19 +381,21 @@ where
     P: Middleware<Error = ProviderError> + 'static,
     D: RelayerDb + Clone + 'static,
 {
-    new_service_internal(eth_node, database, config)
+    let retry_on_fail = false;
+    new_service_internal(eth_node, database, config, retry_on_fail)
 }
 
 fn new_service_internal<P, D>(
     eth_node: P,
     database: D,
     config: Config,
+    retry_on_error: bool,
 ) -> CustomizableService<P, D>
 where
     P: Middleware<Error = ProviderError> + 'static,
     D: RelayerDb + Clone + 'static,
 {
-    let task = NotInitializedTask::new(eth_node, database, config);
+    let task = NotInitializedTask::new(eth_node, database, config, retry_on_error);
 
     CustomizableService::new(task)
 }

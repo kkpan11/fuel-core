@@ -1,8 +1,9 @@
 use super::{
     BlockImporterAdapter,
+    ConsensusAdapter,
     P2PAdapter,
-    VerifierAdapter,
 };
+use fuel_core_poa::ports::RelayerPort;
 use fuel_core_services::stream::BoxStream;
 use fuel_core_sync::ports::{
     BlockImporterPort,
@@ -66,6 +67,25 @@ impl PeerToPeerPort for P2PAdapter {
 
     async fn get_transactions(
         &self,
+        block_ids: Range<u32>,
+    ) -> anyhow::Result<SourcePeer<Option<Vec<Transactions>>>> {
+        let result = if let Some(service) = &self.service {
+            service.get_transactions(block_ids).await
+        } else {
+            Err(anyhow::anyhow!("No P2P service available"))
+        };
+        match result {
+            Ok((peer_id, transactions)) => {
+                let peer_id: PeerId = peer_id.into();
+                let transactions = peer_id.bind(transactions);
+                Ok(transactions)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn get_transactions_from_peer(
+        &self,
         range: SourcePeer<Range<u32>>,
     ) -> anyhow::Result<Option<Vec<Transactions>>> {
         let SourcePeer {
@@ -73,9 +93,7 @@ impl PeerToPeerPort for P2PAdapter {
             data: range,
         } = range;
         if let Some(service) = &self.service {
-            service
-                .get_transactions_from_peer(peer_id.into(), range)
-                .await
+            service.get_transactions_from_peer(peer_id, range).await
         } else {
             Err(anyhow::anyhow!("No P2P service available"))
         }
@@ -124,7 +142,6 @@ impl PeerReport for P2PAdapterPeerReport {
     }
 }
 
-#[async_trait::async_trait]
 impl BlockImporterPort for BlockImporterAdapter {
     fn committed_height_stream(&self) -> BoxStream<BlockHeight> {
         use futures::StreamExt;
@@ -142,12 +159,16 @@ impl BlockImporterPort for BlockImporterAdapter {
     }
 }
 
-#[async_trait::async_trait]
-impl ConsensusPort for VerifierAdapter {
+impl ConsensusPort for ConsensusAdapter {
     fn check_sealed_header(&self, header: &SealedBlockHeader) -> anyhow::Result<bool> {
         Ok(self.block_verifier.verify_consensus(header))
     }
     async fn await_da_height(&self, da_height: &DaBlockHeight) -> anyhow::Result<()> {
-        self.block_verifier.await_da_height(da_height).await
+        tokio::time::timeout(
+            self.config.max_wait_time,
+            self.maybe_relayer
+                .await_until_if_in_range(da_height, &self.config.max_da_lag),
+        )
+        .await?
     }
 }

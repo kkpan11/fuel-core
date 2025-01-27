@@ -1,3 +1,4 @@
+#![allow(clippy::arithmetic_side_effects)]
 use std::time::Duration;
 
 use super::*;
@@ -28,7 +29,7 @@ struct Input {
 )]
 #[test_case(
     Input {
-        headers: Duration::from_millis(10),
+        headers: Duration::from_millis(100),
         ..Default::default()
     },
     State::new(None, 0),
@@ -41,55 +42,56 @@ struct Input {
 )]
 #[test_case(
     Input {
-        headers: Duration::from_millis(10),
+        headers: Duration::from_millis(100),
         ..Default::default()
     },
-    State::new(None, 100),
+    State::new(None, 1000),
     Config{
         block_stream_buffer_size: 10,
-        header_batch_size: 10,
+        header_batch_size: 5,
     }
-    => is less_or_equal_than Count{ headers: 10, consensus: 10, transactions: 10, executes: 1, blocks: 21 }
-    ; "100 headers with max 10 with slow headers"
+    => is less_or_equal_than Count{ headers: 10, consensus: 10, transactions: 10, executes: 1, blocks: 50 }
+    ; "1000 headers with max 5 size and max 10 requests when slow headers"
 )]
 #[test_case(
     Input {
-        transactions: Duration::from_millis(10),
+        transactions: Duration::from_millis(100),
         ..Default::default()
     },
-    State::new(None, 100),
+    State::new(None, 1000),
     Config{
         block_stream_buffer_size: 10,
-        header_batch_size: 10,
+        header_batch_size: 5,
     }
-    => is less_or_equal_than Count{ headers: 10, consensus: 10, transactions: 10, executes: 1, blocks: 21 }
-    ; "100 headers with max 10 with slow transactions"
+    => is less_or_equal_than Count{ headers: 10, consensus: 10, transactions: 10, executes: 1, blocks: 50 }
+    ; "1000 headers with max 5 size and max 10 requests when transactions"
 )]
 #[test_case(
     Input {
-        executes: Duration::from_millis(10),
+        consensus: Duration::from_millis(100),
         ..Default::default()
     },
-    State::new(None, 50),
+    State::new(None, 1000),
     Config{
         block_stream_buffer_size: 10,
-        header_batch_size: 10,
+        header_batch_size: 5,
     }
-    => is less_or_equal_than Count{ headers: 10, consensus: 10, transactions: 10, executes: 1, blocks: 21 }
-    ; "50 headers with max 10 with slow executes"
+    => is less_or_equal_than Count{ headers: 10, consensus: 10, transactions: 10, executes: 1, blocks: 50 }
+    ; "1000 headers with max 5 size and max 10 requests when consensus"
 )]
 #[test_case(
     Input {
-        executes: Duration::from_millis(10),
+        executes: Duration::from_millis(20),
         ..Default::default()
     },
-    State::new(None, 50),
+    State::new(None, 1000),
     Config{
         block_stream_buffer_size: 10,
-        header_batch_size: 10,
+        header_batch_size: 5,
     }
-    => is less_or_equal_than Count{ headers: 10, consensus: 10, transactions: 10, executes: 1, blocks: 21 }
-    ; "50 headers with max 10 size and max 10 requests"
+    => is less_or_equal_than Count{ headers: 10, consensus: 10, transactions: 10, executes: 1, blocks: 60 }
+    ; "1000 headers with max 5 size and max 10 requests when execution is slow. \
+        50 blocks should be fetched; 5 awaits pushing to execution; 5 is executing;"
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_back_pressure(input: Input, state: State, params: Config) -> Count {
@@ -104,13 +106,14 @@ async fn test_back_pressure(input: Input, state: State, params: Config) -> Count
     let consensus = Arc::new(PressureConsensus::new(counts.clone(), input.consensus));
     let notify = Arc::new(Notify::new());
 
-    let import = Import {
+    let mut import = Import {
         state,
         notify,
         params,
         p2p,
         executor,
         consensus,
+        cache: Cache::new(),
     };
 
     import.notify.notify_one();

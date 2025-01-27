@@ -1,5 +1,7 @@
 //! # Fuel Relayer
 
+#![deny(clippy::arithmetic_side_effects)]
+#![deny(clippy::cast_possible_truncation)]
 #![deny(unused_crate_dependencies)]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -14,6 +16,7 @@ mod service;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod mock_db;
 pub mod ports;
+pub mod storage;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
 

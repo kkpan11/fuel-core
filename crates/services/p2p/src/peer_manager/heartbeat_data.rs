@@ -1,7 +1,10 @@
 use fuel_core_types::fuel_types::BlockHeight;
 use std::{
     collections::VecDeque,
-    time::Duration,
+    time::{
+        Duration,
+        SystemTime,
+    },
 };
 use tokio::time::Instant;
 
@@ -9,6 +12,7 @@ use tokio::time::Instant;
 pub struct HeartbeatData {
     pub block_height: Option<BlockHeight>,
     pub last_heartbeat: Instant,
+    pub last_heartbeat_sys: SystemTime,
     // Size of moving average window
     pub window: u32,
     pub durations: VecDeque<Duration>,
@@ -19,6 +23,7 @@ impl HeartbeatData {
         Self {
             block_height: None,
             last_heartbeat: Instant::now(),
+            last_heartbeat_sys: SystemTime::now(),
             window,
             durations: VecDeque::with_capacity(window as usize),
         }
@@ -32,7 +37,13 @@ impl HeartbeatData {
         if self.durations.is_empty() {
             Duration::from_secs(0)
         } else {
-            self.durations.iter().sum::<Duration>() / self.durations.len() as u32
+            let len = u32::try_from(self.durations.len())
+                .expect("The size of window is `u32`, so it is impossible to overflow");
+            self.durations
+                .iter()
+                .sum::<Duration>()
+                .checked_div(len)
+                .expect("The length is non-zero because of the check above")
         }
     }
 
@@ -45,16 +56,18 @@ impl HeartbeatData {
 
     pub fn update(&mut self, block_height: BlockHeight) {
         self.block_height = Some(block_height);
-        let old_hearbeat = self.last_heartbeat;
+        let old_heartbeat = self.last_heartbeat;
         self.last_heartbeat = Instant::now();
-        let new_duration = self.last_heartbeat - old_hearbeat;
+        self.last_heartbeat_sys = SystemTime::now();
+        let new_duration = self.last_heartbeat.saturating_duration_since(old_heartbeat);
         self.add_new_duration(new_duration);
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
+#[allow(non_snake_case)]
 #[cfg(test)]
 mod tests {
-    #![allow(non_snake_case)]
     use super::*;
 
     #[tokio::test(start_paused = true)]

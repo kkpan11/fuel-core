@@ -1,98 +1,29 @@
-use crate::graphql_api::ports::DatabasePort;
+use crate::fuel_core_graphql_api::database::ReadView;
+use fuel_core_services::yield_stream::StreamYieldExt;
 use fuel_core_storage::{
-    iter::{
-        BoxedIter,
-        IntoBoxedIter,
-        IterDirection,
-    },
-    not_found,
-    tables::{
-        FuelBlocks,
-        SealedBlockConsensus,
-    },
+    iter::IterDirection,
     Result as StorageResult,
-    StorageAsRef,
 };
 use fuel_core_types::{
-    blockchain::{
-        block::CompressedBlock,
-        consensus::Consensus,
-        primitives::BlockId,
-    },
+    blockchain::block::CompressedBlock,
     fuel_types::BlockHeight,
 };
+use futures::Stream;
 
-pub trait SimpleBlockData: Send + Sync {
-    fn block(&self, id: &BlockId) -> StorageResult<CompressedBlock>;
-}
-
-impl<D: DatabasePort + ?Sized> SimpleBlockData for D {
-    fn block(&self, id: &BlockId) -> StorageResult<CompressedBlock> {
-        let block = self
-            .storage::<FuelBlocks>()
-            .get(id)?
-            .ok_or_else(|| not_found!(FuelBlocks))?
-            .into_owned();
-
-        Ok(block)
+impl ReadView {
+    pub fn latest_block_height(&self) -> StorageResult<BlockHeight> {
+        self.latest_height()
     }
-}
 
-pub trait BlockQueryData: Send + Sync + SimpleBlockData {
-    fn block_id(&self, height: &BlockHeight) -> StorageResult<BlockId>;
+    pub fn latest_block(&self) -> StorageResult<CompressedBlock> {
+        self.block(&self.latest_block_height()?)
+    }
 
-    fn latest_block_id(&self) -> StorageResult<BlockId>;
-
-    fn latest_block_height(&self) -> StorageResult<BlockHeight>;
-
-    fn latest_block(&self) -> StorageResult<CompressedBlock>;
-
-    fn compressed_blocks(
+    pub fn compressed_blocks(
         &self,
-        start: Option<BlockHeight>,
+        height: Option<BlockHeight>,
         direction: IterDirection,
-    ) -> BoxedIter<StorageResult<CompressedBlock>>;
-
-    fn consensus(&self, id: &BlockId) -> StorageResult<Consensus>;
-}
-
-impl<D: DatabasePort + ?Sized> BlockQueryData for D {
-    fn block_id(&self, height: &BlockHeight) -> StorageResult<BlockId> {
-        self.block_id(height)
-    }
-
-    fn latest_block_id(&self) -> StorageResult<BlockId> {
-        self.ids_of_latest_block().map(|(_, id)| id)
-    }
-
-    fn latest_block_height(&self) -> StorageResult<BlockHeight> {
-        self.ids_of_latest_block().map(|(height, _)| height)
-    }
-
-    fn latest_block(&self) -> StorageResult<CompressedBlock> {
-        self.latest_block_id().and_then(|id| self.block(&id))
-    }
-
-    fn compressed_blocks(
-        &self,
-        start: Option<BlockHeight>,
-        direction: IterDirection,
-    ) -> BoxedIter<StorageResult<CompressedBlock>> {
-        self.blocks_ids(start.map(Into::into), direction)
-            .map(|result| {
-                result.and_then(|(_, id)| {
-                    let block = self.block(&id)?;
-
-                    Ok(block)
-                })
-            })
-            .into_boxed()
-    }
-
-    fn consensus(&self, id: &BlockId) -> StorageResult<Consensus> {
-        self.storage::<SealedBlockConsensus>()
-            .get(id)
-            .map(|c| c.map(|c| c.into_owned()))?
-            .ok_or(not_found!(SealedBlockConsensus))
+    ) -> impl Stream<Item = StorageResult<CompressedBlock>> + '_ {
+        futures::stream::iter(self.blocks(height, direction)).yield_each(self.batch_size)
     }
 }

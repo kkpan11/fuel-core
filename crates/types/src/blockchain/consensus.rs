@@ -2,10 +2,6 @@
 
 use crate::{
     blockchain::primitives::BlockId,
-    fuel_crypto::{
-        PublicKey,
-        Signature,
-    },
     fuel_tx::Input,
     fuel_types::{
         Address,
@@ -20,6 +16,7 @@ use poa::PoAConsensus;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 /// The consensus related data that doesn't live on the
 /// header.
 pub enum Consensus {
@@ -35,7 +32,10 @@ impl Consensus {
         match &self {
             Consensus::Genesis(_) => Ok(Address::zeroed()),
             Consensus::PoA(poa_data) => {
-                let public_key = poa_data.signature.recover(block_id.as_message())?;
+                let public_key = poa_data
+                    .signature
+                    .recover(block_id.as_message())
+                    .map_err(|e| anyhow::anyhow!("Can't recover public key: {:?}", e))?;
                 let address = Input::owner(&public_key);
                 Ok(address)
             }
@@ -67,20 +67,6 @@ pub struct Sealed<Entity> {
     pub consensus: Consensus,
 }
 
-/// A vote from a validator.
-///
-/// This is a dummy placeholder for the Vote Struct in fuel-bft
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct ConsensusVote {
-    block_id: Bytes32,
-    height: u64,
-    round: u64,
-    signature: Signature,
-    // step: Step,
-    validator: PublicKey,
-}
-
 /// The first block of the blockchain is a genesis block. It determines the initial state of the
 /// network - contracts states, contracts balances, unspent coins, and messages. It also contains
 /// the hash on the initial config of the network that defines the consensus rules for following
@@ -97,4 +83,6 @@ pub struct Genesis {
     pub contracts_root: Bytes32,
     /// The Binary Merkle Tree root of all genesis messages.
     pub messages_root: Bytes32,
+    /// The Binary Merkle Tree root of all processed transaction ids.
+    pub transactions_root: Bytes32,
 }

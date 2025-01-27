@@ -17,7 +17,7 @@ pub struct ContractByIdArgs {
     pub id: ContractId,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(
     schema_path = "./assets/schema.sdl",
     graphql_type = "Query",
@@ -28,7 +28,7 @@ pub struct ContractByIdQuery {
     pub contract: Option<Contract>,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct ContractBalance {
     pub contract: ContractId,
@@ -42,7 +42,7 @@ pub struct ContractBalanceQueryArgs {
     pub asset: AssetId,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(
     schema_path = "./assets/schema.sdl",
     graphql_type = "Query",
@@ -53,7 +53,7 @@ pub struct ContractBalanceQuery {
     pub contract_balance: ContractBalance,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct Contract {
     pub id: ContractId,
@@ -61,7 +61,7 @@ pub struct Contract {
     pub salt: Salt,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl", graphql_type = "Contract")]
 pub struct ContractIdFragment {
     pub id: ContractId,
@@ -89,21 +89,21 @@ pub struct ContractBalancesConnectionArgs {
     pub last: Option<i32>,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct ContractBalanceEdge {
     pub cursor: String,
     pub node: ContractBalance,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct ContractBalanceConnection {
     pub edges: Vec<ContractBalanceEdge>,
     pub page_info: PageInfo,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(
     schema_path = "./assets/schema.sdl",
     graphql_type = "Query",
@@ -121,7 +121,7 @@ impl From<(ContractId, PaginationRequest<String>)> for ContractBalancesConnectio
                 filter: ContractBalanceFilterInput { contract: r.0 },
                 after: r.1.cursor,
                 before: None,
-                first: Some(r.1.results as i32),
+                first: Some(r.1.results),
                 last: None,
             },
             PageDirection::Backward => ContractBalancesConnectionArgs {
@@ -129,7 +129,7 @@ impl From<(ContractId, PaginationRequest<String>)> for ContractBalancesConnectio
                 after: None,
                 before: r.1.cursor,
                 first: None,
-                last: Some(r.1.results as i32),
+                last: Some(r.1.results),
             },
         }
     }

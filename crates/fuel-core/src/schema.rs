@@ -1,3 +1,7 @@
+use crate::fuel_core_graphql_api::{
+    api_service::ReadDatabase,
+    database::ReadView,
+};
 use anyhow::anyhow;
 use async_graphql::{
     connection::{
@@ -7,6 +11,8 @@ use async_graphql::{
         Edge,
         EmptyFields,
     },
+    parser::types::OperationType,
+    Context,
     MergedObject,
     MergedSubscription,
     OutputType,
@@ -17,33 +23,53 @@ use fuel_core_storage::{
     iter::IterDirection,
     Result as StorageResult,
 };
-use itertools::Itertools;
+use futures::{
+    Stream,
+    TryStreamExt,
+};
+use std::borrow::Cow;
+use tokio_stream::StreamExt;
 
+pub mod assets;
 pub mod balance;
+pub mod blob;
 pub mod block;
 pub mod chain;
 pub mod coins;
 pub mod contract;
+pub mod da_compressed;
 pub mod dap;
 pub mod health;
 pub mod message;
 pub mod node_info;
+pub mod upgrades;
+
+pub mod gas_price;
 pub mod scalars;
 pub mod tx;
 
+pub mod relayed_tx;
+
 #[derive(MergedObject, Default)]
 pub struct Query(
+    assets::AssetInfoQuery,
     dap::DapQuery,
     balance::BalanceQuery,
+    blob::BlobQuery,
     block::BlockQuery,
     chain::ChainQuery,
     tx::TxQuery,
     health::HealthQuery,
     coins::CoinQuery,
+    da_compressed::DaCompressedBlockQuery,
     contract::ContractQuery,
     contract::ContractBalanceQuery,
     node_info::NodeQuery,
+    gas_price::LatestGasPriceQuery,
+    gas_price::EstimateGasPriceQuery,
     message::MessageQuery,
+    relayed_tx::RelayedTransactionQuery,
+    upgrades::UpgradeQuery,
 );
 
 #[derive(MergedObject, Default)]
@@ -79,7 +105,7 @@ where
     //  It means also returning `has_previous_page` and `has_next_page` values.
     // entries(start_key: Option<DBKey>)
     F: FnOnce(&Option<SchemaKey>, IterDirection) -> StorageResult<Entries>,
-    Entries: Iterator<Item = StorageResult<(SchemaKey, SchemaValue)>>,
+    Entries: Stream<Item = StorageResult<(SchemaKey, SchemaValue)>>,
     SchemaKey: Eq,
 {
     match (after.as_ref(), before.as_ref(), first, last) {
@@ -101,7 +127,7 @@ where
             )
             .into())
         }
-        (None, None, None, None) => {
+        (_, _, None, None) => {
             return Err(anyhow!("The queries for the whole range is not supported").into())
         }
         (_, _, _, _) => { /* Other combinations are allowed */ }
@@ -118,8 +144,7 @@ where
             } else if let Some(last) = last {
                 (last, IterDirection::Reverse)
             } else {
-                // Unreachable because of the check `(None, None, None, None)` above
-                unreachable!()
+                return Err(anyhow!("Either `first` or `last` should be provided"))
             };
 
             let start;
@@ -154,7 +179,7 @@ where
                 false
             });
 
-            let mut count = count + 1 /* for `has_next_page` */;
+            let mut count = count.saturating_add(1) /* for `has_next_page` */;
             let entries = entries.take(count).take_while(|result| {
                 if let Ok((key, _)) = result {
                     if let Some(end) = end.as_ref() {
@@ -164,7 +189,7 @@ where
                             return false
                         }
                     }
-                    count -= 1;
+                    count = count.saturating_sub(1);
                     has_next_page |= count == 0;
                     count != 0
                 } else {
@@ -173,7 +198,7 @@ where
                 }
             });
 
-            let entries: Vec<_> = entries.try_collect()?;
+            let entries: Vec<_> = entries.try_collect().await?;
             let entries = entries.into_iter();
 
             let mut connection = Connection::new(has_previous_page, has_next_page);
@@ -188,4 +213,25 @@ where
         },
     )
     .await
+}
+
+pub trait ReadViewProvider {
+    /// Returns the read view for the current operation.
+    fn read_view(&self) -> StorageResult<Cow<ReadView>>;
+}
+
+impl<'a> ReadViewProvider for Context<'a> {
+    fn read_view(&self) -> StorageResult<Cow<'a, ReadView>> {
+        let operation_type = self.query_env.operation.node.ty;
+
+        // Sometimes, during mutable queries or subscription the resolvers
+        // need access to an updated view of the database.
+        if operation_type != OperationType::Query {
+            let database: &ReadDatabase = self.data_unchecked();
+            database.view().map(Cow::Owned)
+        } else {
+            let read_view: &ReadView = self.data_unchecked();
+            Ok(Cow::Borrowed(read_view))
+        }
+    }
 }
